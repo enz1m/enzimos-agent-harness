@@ -1,0 +1,886 @@
+// SPDX-License-Identifier: MIT
+//! Minimal private per-user service; the shell owns presentation. One JSON
+//! request line per connection; turns stream event lines until the outcome.
+use crate::{
+    Result, ToolError, fail,
+    mcp::Mcp,
+    provider::Gateway,
+    runtime::{self, Complete, Session, Shared},
+    skills::Skills,
+    tools::Workspace,
+    uid,
+};
+use serde_json::{Value, json};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
+    io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+    rc::Rc,
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
+};
+
+pub const MAX_FRAME: usize = 1024 * 1024;
+
+pub fn private_directory(path: &Path) -> Result<PathBuf> {
+    let m = std::fs::symlink_metadata(path)
+        .map_err(|_| ToolError("private owned directory required".into()))?;
+    if !m.is_dir() || m.uid() != uid() || m.mode() & 0o077 != 0 {
+        return fail("private owned directory required");
+    }
+    Ok(path.to_path_buf())
+}
+
+pub fn config_file(path: &Path) -> Result<Value> {
+    let refuse = || ToolError("private owned configuration required".into());
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| refuse())?;
+    let m = file.metadata().map_err(|_| refuse())?;
+    if !m.is_file() || m.uid() != uid() || m.mode() & 0o077 != 0 || m.len() > 65536 {
+        return Err(refuse());
+    }
+    let mut raw = Vec::new();
+    (&mut file)
+        .take(65537)
+        .read_to_end(&mut raw)
+        .map_err(|_| refuse())?;
+    serde_json::from_slice(&raw).map_err(|_| refuse())
+}
+
+fn home() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/nonexistent"), PathBuf::from)
+}
+
+pub struct Service {
+    config: Value,
+    state: PathBuf,
+    complete: Complete,
+    sessions: RefCell<HashMap<String, Shared>>,
+    clients: Cell<usize>,
+    active: Cell<usize>,
+    busy: RefCell<HashSet<String>>,
+    skills: Skills,
+    protected: Vec<PathBuf>,
+}
+
+fn session_id(value: &Value) -> Result<String> {
+    value
+        .as_str()
+        .filter(|s| {
+            s.len() == 32
+                && s.bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| ToolError("invalid saved session identity".into()))
+}
+
+/// What every turn is told first: where its tools act and how to recover
+/// from a path mistake; small local models otherwise guess absolute paths or
+/// give up after one error.
+const BASE_INSTRUCTIONS: &str = "You are the enzimOS assistant, working in the folder the user chose (the workspace). \
+Use the tools to look at and change it. Paths are relative to the workspace, such as \"todo.txt\" or \"notes/plan.md\"; \
+call files_list with a null path to see what is there. When a tool reports a path error, correct the path and call it again. \
+Answer briefly, from what the tools returned.";
+
+/// A saved transcript's title (its first request) and preview (its last
+/// reply, else its last request), each one line of plain text.
+fn headline(messages: &[Value]) -> (Option<String>, Option<String>) {
+    let said = |role: &'static str| {
+        messages
+            .iter()
+            .filter(move |m| m["role"] == role)
+            .filter_map(|m| m["content"].as_str())
+            .filter(|t| !t.trim().is_empty())
+    };
+    let line = |text: &str, length: usize| {
+        text.lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim_start_matches(['#', ' ', '>', '-', '*'])
+            .chars()
+            .take(length)
+            .collect::<String>()
+    };
+    let title = said("user").next().map(|t| line(t, 60));
+    let preview = said("assistant")
+        .last()
+        .or_else(|| said("user").last())
+        .map(|t| line(t, 90));
+    (title, preview)
+}
+
+/// A saved transcript as a client shows it: user and assistant text, and each
+/// tool call with its result.
+fn items(messages: &[Value]) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut calls: HashMap<String, usize> = HashMap::new();
+    for message in messages {
+        match message["role"].as_str().unwrap_or_default() {
+            "user" => items.push(json!({"kind": "user", "text": message["content"]})),
+            "assistant" => {
+                if let Some(text) = message["content"].as_str().filter(|t| !t.is_empty()) {
+                    items.push(json!({"kind": "assistant", "text": text}));
+                }
+                for call in message["tool_calls"].as_array().into_iter().flatten() {
+                    let arguments = call["function"]["arguments"]
+                        .as_str()
+                        .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                        .unwrap_or(Value::Null);
+                    calls.insert(
+                        call["id"].as_str().unwrap_or_default().to_owned(),
+                        items.len(),
+                    );
+                    items.push(json!({"kind": "tool", "tool": call["function"]["name"], "title": "", "arguments": arguments, "output": "", "status": "cancelled"}));
+                }
+            }
+            "tool" => {
+                let Some(&index) = message["tool_call_id"]
+                    .as_str()
+                    .and_then(|id| calls.get(id))
+                else {
+                    continue;
+                };
+                let result = message["content"]
+                    .as_str()
+                    .and_then(|c| serde_json::from_str::<Value>(c).ok())
+                    .unwrap_or(Value::Null);
+                let (status, output) = match (&result["ok"], &result["result"], &result["error"]) {
+                    (Value::Bool(true), Value::String(text), _) => ("completed", text.clone()),
+                    (Value::Bool(true), other, _) => ("completed", other.to_string()),
+                    (_, _, Value::String(error)) if error == "tool-call-cancelled" => {
+                        ("cancelled", String::new())
+                    }
+                    (_, _, error) => ("failed", error.as_str().unwrap_or_default().to_owned()),
+                };
+                items[index]["status"] = json!(status);
+                items[index]["output"] = json!(runtime::shown(&output));
+            }
+            _ => {}
+        }
+    }
+    items
+}
+
+impl Service {
+    pub fn new(
+        config: Value,
+        state: &Path,
+        complete: Option<Complete>,
+        protected: &[PathBuf],
+    ) -> Result<Rc<Self>> {
+        let state = private_directory(state)?;
+        let complete = match complete {
+            Some(complete) => complete,
+            None => {
+                let gateway = Rc::new(Gateway {
+                    path: PathBuf::from(
+                        config["gateway_socket"]
+                            .as_str()
+                            .ok_or_else(|| ToolError("gateway socket required".into()))?,
+                    ),
+                });
+                Rc::new(move |body, delta| {
+                    let gateway = gateway.clone();
+                    Box::pin(async move { gateway.complete(body, delta).await })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>>>>
+                })
+            }
+        };
+        let home = home();
+        let mut paths = vec![state.clone()];
+        for private in [
+            ".ssh",
+            ".gnupg",
+            ".git-credentials",
+            ".netrc",
+            ".pgpass",
+            ".aws",
+            ".azure",
+            ".kube",
+            ".docker",
+            ".password-store",
+            ".mozilla",
+            ".var/app",
+        ] {
+            paths.push(home.join(private));
+        }
+
+        // Protect desktop credentials under both the active and default XDG roots.
+        for (variable, default, private) in [
+            (
+                "XDG_CONFIG_HOME",
+                ".config",
+                &[
+                    "enzimos",
+                    "enzui/apps",
+                    "enzui/agents",
+                    "gh",
+                    "git/credentials",
+                    "gcloud",
+                    "chromium",
+                    "google-chrome",
+                    "BraveSoftware",
+                ][..],
+            ),
+            ("XDG_DATA_HOME", ".local/share", &["keyrings"]),
+            ("XDG_STATE_HOME", ".local/state", &["enzui"]),
+        ] {
+            let default = home.join(default);
+            paths.extend(private.iter().map(|path| default.join(path)));
+            if let Some(active) = std::env::var_os(variable)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute() && *path != default)
+            {
+                paths.extend(private.iter().map(|path| active.join(path)));
+            }
+        }
+        paths.extend(protected.iter().cloned());
+        let configured = config.get("protected_paths").cloned().unwrap_or(json!([]));
+        let configured = configured
+            .as_array()
+            .filter(|c| c.len() <= 32)
+            .and_then(|c| {
+                c.iter()
+                    .map(|p| p.as_str().filter(|p| p.starts_with('/')).map(PathBuf::from))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(|| ToolError("invalid protected service paths".into()))?;
+        paths.extend(configured);
+        let skills = Skills::new(config.get("skill_directories").unwrap_or(&json!([])))?;
+        Ok(Rc::new(Self {
+            config,
+            state,
+            complete,
+            sessions: RefCell::new(HashMap::new()),
+            clients: Cell::new(0),
+            active: Cell::new(0),
+            busy: RefCell::new(HashSet::new()),
+            skills,
+            protected: paths,
+        }))
+    }
+
+    fn save(&self, session: &Session) -> Result<()> {
+        let body = json!({"schema_version": 1, "id": session.id, "workspace": session.workspace.path, "provider": session.provider, "model": session.model,
+            "policy": session.policy, "messages": session.messages, "last_sequence": session.sequence, "profile": session.profile});
+        let raw = body.to_string();
+        if raw.len() > 2 * MAX_FRAME {
+            return fail("session state exceeds limit");
+        }
+        let temporary = self.state.join(format!(".session-{}", runtime::token()));
+        let result = (|| -> std::io::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temporary)?;
+            file.write_all(raw.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, self.state.join(format!("{}.json", session.id)))
+        })();
+        let _ = std::fs::remove_file(&temporary);
+        result.map_err(|_| ToolError("session state unavailable".into()))
+    }
+
+    fn create(&self, request: &Value) -> Result<Value> {
+        if self.sessions.borrow().len() >= 16 {
+            // Every turn is saved, so closing the longest-idle session loses only
+            // its event buffer; clients that crashed never close theirs.
+            let idle = self
+                .sessions
+                .borrow()
+                .iter()
+                .filter(|(id, s)| s.borrow().task.is_none() && !self.busy.borrow().contains(*id))
+                .min_by_key(|(_, s)| s.borrow().last_active)
+                .map(|(id, _)| id.clone());
+            match idle {
+                Some(id) => {
+                    self.sessions.borrow_mut().remove(&id);
+                }
+                None => return fail("session limit exceeded"),
+            }
+        }
+        let profile_name = match request.get("profile") {
+            None => "default".to_owned(),
+            Some(name) => name
+                .as_str()
+                .ok_or_else(|| ToolError("invalid session policy profile".into()))?
+                .to_owned(),
+        };
+        let profile = self.config["profiles"]
+            .get(&profile_name)
+            .filter(|p| p.is_object())
+            .ok_or_else(|| ToolError("unknown session policy profile".into()))?;
+        let workspace = std::fs::canonicalize(
+            request["workspace"]
+                .as_str()
+                .ok_or_else(|| ToolError("workspace required".into()))?,
+        )
+        .map_err(|_| ToolError("workspace unavailable".into()))?;
+        let roots = profile["workspace_roots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|r| {
+                r.as_str()
+                    .and_then(|r| std::fs::canonicalize(r).ok())
+                    .ok_or_else(|| ToolError("workspace root unavailable".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !roots.iter().any(|root| workspace.starts_with(root)) {
+            return fail("workspace outside approved profile roots");
+        }
+        let provider = match request
+            .get("provider")
+            .or_else(|| self.config.get("default_provider"))
+        {
+            None => "local".to_owned(),
+            Some(name) => name
+                .as_str()
+                .ok_or_else(|| ToolError("invalid provider".into()))?
+                .to_owned(),
+        };
+        let providers = self
+            .config
+            .get("providers")
+            .cloned()
+            .unwrap_or(json!(["local"]));
+        if !providers
+            .as_array()
+            .is_some_and(|p| p.contains(&json!(provider)))
+        {
+            return fail("provider not approved");
+        }
+        let model = request["model"]
+            .as_str()
+            .filter(|m| (1..=128).contains(&m.chars().count()))
+            .ok_or_else(|| ToolError("invalid model identity".into()))?;
+        let flag = |k: &str| profile.get(k).cloned().unwrap_or(json!(false));
+        let policy = json!({"writes": flag("allow_writes"), "commands": flag("allow_commands"), "network": flag("allow_network")});
+        let session = Session::new(
+            Workspace::new(&workspace, &self.protected)?,
+            &provider,
+            model,
+            policy.clone(),
+            &profile_name,
+        )?;
+        self.save(&session)?;
+        let id = session.id.clone();
+        self.sessions
+            .borrow_mut()
+            .insert(id.clone(), Rc::new(RefCell::new(session)));
+        Ok(json!({"session_id": id, "policy": policy}))
+    }
+
+    fn stored(&self, identity: &Value) -> Result<Value> {
+        let identity = session_id(identity)?;
+        let path = self.state.join(format!("{identity}.json"));
+        let invalid = || ToolError("invalid saved session file".into());
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            .map_err(|_| invalid())?;
+        let m = file.metadata().map_err(|_| invalid())?;
+        if !m.is_file()
+            || m.uid() != uid()
+            || m.mode() & 0o077 != 0
+            || m.len() > 2 * MAX_FRAME as u64
+        {
+            return Err(invalid());
+        }
+        let mut raw = Vec::new();
+        (&mut file)
+            .take(2 * MAX_FRAME as u64 + 1)
+            .read_to_end(&mut raw)
+            .map_err(|_| invalid())?;
+        if raw.len() > 2 * MAX_FRAME {
+            return fail("saved session exceeds limit");
+        }
+        let body: Value = serde_json::from_slice(&raw).map_err(|_| invalid())?;
+        if body["schema_version"] != 1
+            || !body["schema_version"].is_u64()
+            || body["id"] != identity.as_str()
+        {
+            return fail("invalid saved session format");
+        }
+        Ok(body)
+    }
+
+    fn saved_list(&self) -> Result<Value> {
+        let mut names = std::fs::read_dir(&self.state)
+            .map_err(|_| ToolError("session state unavailable".into()))?
+            .flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".json"))
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        let mut rows = Vec::new();
+        for name in names {
+            if rows.len() >= 128 {
+                return fail("saved session limit exceeded");
+            }
+            let body = self.stored(&json!(name))?;
+            let updated = std::fs::metadata(self.state.join(format!("{name}.json")))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            let (title, preview) =
+                headline(body["messages"].as_array().map_or(&[][..], Vec::as_slice));
+            rows.push(json!({"id": body["id"], "workspace": body["workspace"], "provider": body["provider"], "model": body["model"], "profile": body["profile"],
+                "title": title, "preview": preview, "updated": updated}));
+        }
+        Ok(json!(rows))
+    }
+
+    /// Reopen under the CURRENT profile policy, at the last complete tool boundary.
+    fn resume(&self, request: &Value) -> Result<Value> {
+        let identity = session_id(&request["session_id"])?;
+        if let Some(open) = self.sessions.borrow().get(&identity) {
+            // A client that crashed without closing can take its idle session back.
+            if open.borrow().task.is_some() || self.busy.borrow().contains(&identity) {
+                return fail("session already open");
+            }
+        }
+        self.sessions.borrow_mut().remove(&identity);
+        let body = self.stored(&json!(identity))?;
+        let messages = body["messages"]
+            .as_array()
+            .cloned()
+            .ok_or_else(|| ToolError("invalid saved transcript".into()))?;
+        let sequence = body["last_sequence"]
+            .as_u64()
+            .ok_or_else(|| ToolError("invalid saved transcript".into()))?;
+        if messages.iter().any(|m| {
+            !["user", "assistant", "tool"].contains(&m["role"].as_str().unwrap_or_default())
+        }) {
+            return fail("invalid saved transcript messages");
+        }
+        let mut complete = Vec::new();
+        let mut pending: HashSet<String> = HashSet::new();
+        let mut boundary = 0;
+        for message in &messages {
+            match message["role"].as_str().unwrap_or_default() {
+                "assistant" => {
+                    let calls = match message.get("tool_calls") {
+                        None => vec![],
+                        Some(Value::Array(c)) => c.clone(),
+                        _ => return fail("invalid saved tool batch"),
+                    };
+                    pending = calls
+                        .iter()
+                        .map(|c| {
+                            c["id"]
+                                .as_str()
+                                .map(str::to_owned)
+                                .ok_or_else(|| ToolError("invalid saved tool batch".into()))
+                        })
+                        .collect::<Result<_>>()?;
+                }
+                "tool" => {
+                    let call = message["tool_call_id"].as_str().unwrap_or_default();
+                    if !pending.remove(call) {
+                        return fail("orphan saved tool result");
+                    }
+                }
+                // A batch interrupted by a crash is answered as cancelled, as a
+                // live cancel does, instead of making the history unusable.
+                _ if !pending.is_empty() => {
+                    for id in std::mem::take(&mut pending) {
+                        complete.push(json!({"role": "tool", "tool_call_id": id, "content": json!({"ok": false, "error": "tool-call-cancelled"}).to_string()}));
+                    }
+                    boundary = complete.len();
+                }
+                _ => {}
+            }
+            complete.push(message.clone());
+            if pending.is_empty() {
+                boundary = complete.len();
+            }
+        }
+        let created = self.create(&json!({"workspace": body["workspace"], "provider": body["provider"], "model": body["model"], "profile": body["profile"]}))?;
+        let temporary_id = created["session_id"].as_str().unwrap().to_owned();
+        let session = self.sessions.borrow_mut().remove(&temporary_id).unwrap();
+        let _ = std::fs::remove_file(self.state.join(format!("{temporary_id}.json")));
+        {
+            let mut s = session.borrow_mut();
+            s.id = identity.clone();
+            s.messages = complete[..boundary].to_vec();
+            s.sequence = sequence;
+            self.save(&s)?;
+        }
+        let policy = session.borrow().policy.clone();
+        self.sessions.borrow_mut().insert(identity.clone(), session);
+        Ok(
+            json!({"session_id": identity, "policy": policy, "messages": boundary, "discarded_incomplete_messages": messages.len() - boundary}),
+        )
+    }
+
+    fn text<'a>(request: &'a Value, key: &str) -> Result<&'a str> {
+        request[key]
+            .as_str()
+            .ok_or_else(|| ToolError("invalid request".into()))
+    }
+
+    fn dispatch(&self, request: &Value) -> Result<Value> {
+        match request["method"].as_str().unwrap_or_default() {
+            "session.create" => {
+                if self.saved_list()?.as_array().map_or(0, Vec::len) >= 128 {
+                    return fail("saved session limit reached; explicitly delete old sessions");
+                }
+                return self.create(request);
+            }
+            "session.list" => return self.saved_list(),
+            "session.resume" => return self.resume(request),
+            "session.export" => {
+                let mut body = self.stored(&request["session_id"])?;
+                let messages = body["messages"].as_array().map_or(&[][..], Vec::as_slice);
+                let (items, (title, _)) = (items(messages), headline(messages));
+                body["items"] = json!(items);
+                body["title"] = json!(title);
+                return Ok(body);
+            }
+            "session.delete" => {
+                let id = session_id(&request["session_id"])?;
+                if self.sessions.borrow().contains_key(&id) {
+                    return fail("close session before deleting its history");
+                }
+                self.stored(&json!(id))?;
+                std::fs::remove_file(self.state.join(format!("{id}.json")))
+                    .map_err(|_| ToolError("session state unavailable".into()))?;
+                return Ok(json!({"deleted": true}));
+            }
+            "skills.list" => return self.skills.discover(),
+            "skills.create" => {
+                let directory = Self::text(request, "directory")?;
+                if !self.config["writable_skill_directories"]
+                    .as_array()
+                    .is_some_and(|d| d.contains(&json!(directory)))
+                {
+                    return fail("skill destination not enabled for user creation");
+                }
+                return self.skills.create(
+                    directory,
+                    Self::text(request, "name")?,
+                    Self::text(request, "description")?,
+                    Self::text(request, "instructions")?,
+                );
+            }
+            "skills.load" => {
+                let skill = self
+                    .skills
+                    .load(Self::text(request, "name")?, Self::text(request, "sha256")?)?;
+                return Ok(
+                    json!({"name": skill.name, "description": skill.description, "sha256": skill.sha256, "instructions": skill.instructions}),
+                );
+            }
+            _ => {}
+        }
+        let id = request["session_id"].as_str().unwrap_or_default();
+        let session = self
+            .sessions
+            .borrow()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ToolError("unknown session".into()))?;
+        match request["method"].as_str().unwrap_or_default() {
+            "events.list" => {
+                let s = session.borrow();
+                let cursor = request.get("after").cloned().unwrap_or(json!(0));
+                let cursor = cursor
+                    .as_u64()
+                    .filter(|c| cursor.is_u64() && *c <= s.sequence)
+                    .ok_or_else(|| ToolError("invalid event cursor".into()))?;
+                // One page fits one frame; `more` asks the client to continue
+                // from the last returned sequence.
+                let mut events = Vec::new();
+                let mut bytes = 0;
+                let mut more = false;
+                for event in s
+                    .events
+                    .iter()
+                    .filter(|e| e["sequence"].as_u64().unwrap_or(0) > cursor)
+                {
+                    let n = event.to_string().len() + 1;
+                    if !events.is_empty() && bytes + n > MAX_FRAME - 4096 {
+                        more = true;
+                        break;
+                    }
+                    bytes += n;
+                    events.push(event.clone());
+                }
+                let first = s.events.front().and_then(|e| e["sequence"].as_u64());
+                Ok(
+                    json!({"events": events, "gap": first.is_some_and(|f| cursor + 1 < f), "more": more, "last_sequence": s.sequence}),
+                )
+            }
+            "approval.resolve" => {
+                session.borrow_mut().resolve(
+                    Self::text(request, "request_id")?,
+                    Self::text(request, "binding")?,
+                    &request["allow"],
+                )?;
+                Ok(json!({"resolved": true}))
+            }
+            "turn.steer" => {
+                session.borrow_mut().steer(Self::text(request, "text")?)?;
+                Ok(json!({"steered": true}))
+            }
+            "turn.cancel" => {
+                session.borrow().cancel();
+                Ok(json!({"cancel_requested": true}))
+            }
+            "session.close" => {
+                if session.borrow().task.is_some() || self.busy.borrow().contains(id) {
+                    return fail("cancel the active turn before closing");
+                }
+                self.sessions.borrow_mut().remove(id);
+                Ok(json!({"closed": true}))
+            }
+            _ => fail("unsupported service operation"),
+        }
+    }
+
+    async fn send(writer: &mut OwnedWriteHalf, body: &Value) -> Result<()> {
+        let mut raw = body.to_string().into_bytes();
+        raw.push(b'\n');
+        if raw.len() > MAX_FRAME {
+            return fail("service response exceeds limit");
+        }
+        tokio::time::timeout(Duration::from_secs(5), writer.write_all(&raw))
+            .await
+            .map_err(|_| ToolError("client stalled".into()))?
+            .map_err(|_| ToolError("client closed".into()))
+    }
+
+    async fn turn<R: tokio::io::AsyncRead + Unpin>(
+        self: &Rc<Self>,
+        request: &Value,
+        reader: &mut R,
+        writer: &mut OwnedWriteHalf,
+    ) -> Result<()> {
+        let id = request["session_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let session = self.sessions.borrow().get(&id).cloned();
+        let Some(session) = session.filter(|s| {
+            !self.busy.borrow().contains(&id) && s.borrow().task.is_none() && self.active.get() < 2
+        }) else {
+            return fail("session unavailable or service busy");
+        };
+        // Fallible setup runs before the session is marked busy.
+        let mcp = Rc::new(Mcp::new(
+            self.config.get("mcp_servers").cloned().unwrap_or(json!({})),
+        )?);
+        self.active.set(self.active.get() + 1);
+        self.busy.borrow_mut().insert(id.clone());
+        let (queue, mut events) = tokio::sync::mpsc::channel(256);
+        session.borrow_mut().observers.push(queue);
+        let task = {
+            let (service, session, mcp, request) =
+                (self.clone(), session.clone(), mcp.clone(), request.clone());
+            tokio::task::spawn_local(async move {
+                // One deadline and cancellation owner covers discovery and execution.
+                let work = async {
+                    let selected = request.get("skills").cloned().unwrap_or(json!([]));
+                    let selected = selected
+                        .as_array()
+                        .filter(|s| s.len() <= 8)
+                        .ok_or_else(|| ToolError("skill selection limit exceeded".into()))?;
+                    let mut instructions = vec![BASE_INSTRUCTIONS.to_owned()];
+                    for choice in selected {
+                        let valid = choice.as_object().is_some_and(|c| {
+                            c.len() == 2 && c.contains_key("name") && c.contains_key("sha256")
+                        });
+                        if !valid {
+                            return fail("invalid selected skill");
+                        }
+                        let skill = service.skills.load(
+                            choice["name"].as_str().unwrap_or_default(),
+                            choice["sha256"].as_str().unwrap_or_default(),
+                        )?;
+                        instructions.push(format!("Skill: {}\n{}", skill.name, skill.instructions));
+                    }
+                    let instructions = instructions.join("\n\n");
+                    if instructions.len() > 131072 {
+                        return fail("selected skills exceed context limit");
+                    }
+                    mcp.start().await?;
+                    let prompt = request["prompt"]
+                        .as_str()
+                        .ok_or_else(|| ToolError("invalid turn input".into()))?;
+                    let active = (!mcp.schemas.borrow().is_empty()).then_some(&*mcp);
+                    runtime::run(
+                        &session,
+                        prompt,
+                        &service.complete,
+                        active,
+                        8,
+                        Some(&instructions),
+                    )
+                    .await
+                };
+                tokio::time::timeout(Duration::from_secs(600), work)
+                    .await
+                    .unwrap_or_else(|_| fail("turn deadline exceeded"))
+            })
+        };
+        session.borrow_mut().task = Some(task.abort_handle());
+        let mut task = task;
+        let outcome = loop {
+            tokio::select! {
+                result = &mut task => break Some(result),
+                event = events.recv() => {
+                    if let Some(event) = event
+                        && Self::send(writer, &json!({"event": event})).await.is_err() {
+                            task.abort();
+                            let _ = (&mut task).await;
+                            break None;
+                        }
+                }
+                _ = reader.read_u8() => {
+                    // The client disconnecting cancels the turn.
+                    task.abort();
+                    let _ = (&mut task).await;
+                    break None;
+                }
+            }
+        };
+        while let Ok(event) = events.try_recv() {
+            if outcome.is_some() {
+                let _ = Self::send(writer, &json!({"event": event})).await;
+            }
+        }
+        mcp.close().await;
+        {
+            let mut s = session.borrow_mut();
+            s.observers.clear();
+            s.task = None;
+        }
+        self.active.set(self.active.get() - 1);
+        self.busy.borrow_mut().remove(&id);
+        self.save(&session.borrow())?;
+        match outcome {
+            None => Ok(()),
+            Some(Err(join)) if join.is_cancelled() => {
+                Self::send(
+                    writer,
+                    &json!({"ok": true, "turn_finished": true, "status": "cancelled"}),
+                )
+                .await
+            }
+            Some(Ok(Ok(()))) => {
+                Self::send(writer, &json!({"ok": true, "turn_finished": true})).await
+            }
+            Some(Ok(Err(error))) if error.0 == Skills::CHANGED => Err(error),
+            Some(_) => fail("turn failed"),
+        }
+    }
+
+    async fn client(self: Rc<Self>, stream: UnixStream) {
+        self.clients.set(self.clients.get() + 1);
+        let peer = stream.peer_cred().map(|c| c.uid()).ok();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::with_capacity(65536, reader);
+        let result = async {
+            if self.clients.get() > 16 {
+                return fail("client limit exceeded");
+            }
+            if peer != Some(uid()) {
+                return fail("peer refused");
+            }
+            let mut line = Vec::new();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                (&mut reader)
+                    .take(MAX_FRAME as u64 + 1)
+                    .read_until(b'\n', &mut line),
+            )
+            .await
+            .map_err(|_| ToolError("request timed out".into()))?
+            .map_err(|_| ToolError("request unavailable".into()))?;
+            if !line.ends_with(b"\n") || line.len() > MAX_FRAME {
+                return fail("invalid request frame");
+            }
+            let request: Value =
+                serde_json::from_slice(&line).map_err(|_| ToolError("invalid request".into()))?;
+            if request["schema_version"] != 1 || !request["schema_version"].is_u64() {
+                return fail("unsupported request version");
+            }
+            if request["method"] == "turn.start" {
+                self.turn(&request, &mut reader, &mut writer).await
+            } else {
+                let result = self.dispatch(&request)?;
+                Self::send(&mut writer, &json!({"ok": true, "result": result})).await
+            }
+        }
+        .await;
+        if let Err(error) = result {
+            // Only reasons a client can act on are distinguished.
+            let code = if error.0 == Skills::CHANGED {
+                Skills::CHANGED
+            } else {
+                "request-unavailable"
+            };
+            let _ = Self::send(&mut writer, &json!({"ok": false, "error": code})).await;
+        }
+        let _ = writer.shutdown().await;
+        self.clients.set(self.clients.get() - 1);
+    }
+
+    pub async fn serve(self: Rc<Self>, listener: UnixListener) {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                // Back off on descriptor exhaustion instead of spinning.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            tokio::task::spawn_local(self.clone().client(stream));
+        }
+    }
+
+    /// Cancel running turns and save every open transcript; aborted turn
+    /// handlers never reach their own save.
+    pub fn close(&self) {
+        for session in self.sessions.borrow().values() {
+            session.borrow().cancel();
+            let _ = self.save(&session.borrow());
+        }
+    }
+}
+
+#[allow(unsafe_code, reason = "Linux syscall ABI (umask).")]
+pub fn bind(path: &Path) -> Result<UnixListener> {
+    private_directory(
+        path.parent()
+            .ok_or_else(|| ToolError("socket directory required".into()))?,
+    )?;
+    if std::fs::symlink_metadata(path).is_ok() {
+        return fail("new service socket required");
+    }
+    unsafe { libc::umask(0o077) };
+    let listener = UnixListener::bind(path).map_err(|_| ToolError("socket unavailable".into()))?;
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|_| ToolError("socket unavailable".into()))?;
+    Ok(listener)
+}
+
+#[cfg(test)]
+mod tests;
