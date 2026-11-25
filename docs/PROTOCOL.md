@@ -27,8 +27,10 @@ A profile grants only its configured roots/actions. Requests cannot expand it.
 False action defaults require an exact user approval for each action, rather than
 prohibiting the user from approving one action. Commands require Bubblewrap plus
 a systemd user scope; no fallback executes unsandboxed commands. Service state,
-Center state/credentials, SSH/GPG directories, configuration and runtime endpoints
-are excluded from file tools and command mounts even within an approved root.
+Center state/credentials, SSH/GPG directories, keyrings, AI gateway and Phone Link
+state, configuration and runtime endpoints, and login hooks (shell startup files,
+autostart entries, systemd user units, `environment.d`) are excluded from file
+tools and command mounts even within an approved root.
 Additional `protected_paths` may contain up to32 absolute paths.
 
 ## Sessions and turns

@@ -430,3 +430,51 @@ async fn replies_stream_and_a_steer_gets_its_own_answer() {
         })
         .await;
 }
+
+#[test]
+fn home_workspace_refuses_credentials_and_login_hooks() {
+    let home = tempfile::tempdir().unwrap();
+    let xdg_config = tempfile::tempdir().unwrap();
+    let active = xdg_config.path().to_path_buf();
+    let protected = credential_paths(home.path(), |name| {
+        (name == "XDG_CONFIG_HOME").then(|| active.clone().into_os_string())
+    });
+    for dir in [".config/systemd/user", ".local/state/enzimos-ai-gateway"] {
+        std::fs::create_dir_all(home.path().join(dir)).unwrap();
+    }
+    std::fs::write(home.path().join(".bashrc"), "alias ls=ls").unwrap();
+    std::fs::write(
+        home.path()
+            .join(".local/state/enzimos-ai-gateway/chatgpt-account.json"),
+        "{}",
+    )
+    .unwrap();
+    std::fs::write(home.path().join("notes.txt"), "plain").unwrap();
+    let workspace = Workspace::new(home.path(), &protected).unwrap();
+    for path in [
+        ".bashrc",
+        ".zshrc",
+        ".profile",
+        ".local/state/enzimos-ai-gateway/chatgpt-account.json",
+        ".local/share/enzremote/identity.key",
+        ".local/share/keyrings/login.keyring",
+        ".config/enzremote/devices.json",
+        ".config/autostart/agent.desktop",
+        ".config/systemd/user/agent.service",
+        ".config/environment.d/agent.conf",
+    ] {
+        assert_eq!(
+            workspace.read(path).unwrap_err().0,
+            "protected service data is outside tool authority",
+            "{path}"
+        );
+        assert!(workspace.write(path, "x", None).is_err(), "{path}");
+    }
+    assert!(!home.path().join(".config/autostart").exists());
+    assert_eq!(
+        std::fs::read_to_string(home.path().join(".bashrc")).unwrap(),
+        "alias ls=ls"
+    );
+    assert_eq!(workspace.read("notes.txt").unwrap()["text"], "plain");
+    assert!(protected.contains(&xdg_config.path().join("autostart")));
+}

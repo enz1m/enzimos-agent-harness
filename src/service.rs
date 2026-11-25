@@ -170,6 +170,81 @@ fn items(messages: &[Value]) -> Vec<Value> {
     items
 }
 
+// Credentials and files that run code at login, under active and default XDG roots.
+fn credential_paths(home: &Path, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let mut paths = [
+        ".ssh",
+        ".gnupg",
+        ".git-credentials",
+        ".netrc",
+        ".pgpass",
+        ".aws",
+        ".azure",
+        ".kube",
+        ".docker",
+        ".password-store",
+        ".mozilla",
+        ".var/app",
+        ".profile",
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".bash_logout",
+        ".zshenv",
+        ".zshrc",
+        ".zprofile",
+        ".zlogin",
+        ".zlogout",
+        ".xprofile",
+        ".xinitrc",
+    ]
+    .iter()
+    .map(|path| home.join(path))
+    .collect::<Vec<_>>();
+    for (variable, default, private) in [
+        (
+            "XDG_CONFIG_HOME",
+            ".config",
+            &[
+                "enzimos",
+                "enzui/apps",
+                "enzui/agents",
+                "enzremote",
+                "autostart",
+                "systemd",
+                "environment.d",
+                "fish",
+                "gh",
+                "git/credentials",
+                "gcloud",
+                "chromium",
+                "google-chrome",
+                "BraveSoftware",
+            ][..],
+        ),
+        (
+            "XDG_DATA_HOME",
+            ".local/share",
+            &["keyrings", "enzremote", "systemd"],
+        ),
+        (
+            "XDG_STATE_HOME",
+            ".local/state",
+            &["enzui", "enzimos-ai-gateway"],
+        ),
+    ] {
+        let default = home.join(default);
+        paths.extend(private.iter().map(|path| default.join(path)));
+        if let Some(active) = var(variable)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute() && *path != default)
+        {
+            paths.extend(private.iter().map(|path| active.join(path)));
+        }
+    }
+    paths
+}
+
 impl Service {
     pub fn new(
         config: Value,
@@ -195,54 +270,8 @@ impl Service {
                 })
             }
         };
-        let home = home();
         let mut paths = vec![state.clone()];
-        for private in [
-            ".ssh",
-            ".gnupg",
-            ".git-credentials",
-            ".netrc",
-            ".pgpass",
-            ".aws",
-            ".azure",
-            ".kube",
-            ".docker",
-            ".password-store",
-            ".mozilla",
-            ".var/app",
-        ] {
-            paths.push(home.join(private));
-        }
-
-        // Protect desktop credentials under both the active and default XDG roots.
-        for (variable, default, private) in [
-            (
-                "XDG_CONFIG_HOME",
-                ".config",
-                &[
-                    "enzimos",
-                    "enzui/apps",
-                    "enzui/agents",
-                    "gh",
-                    "git/credentials",
-                    "gcloud",
-                    "chromium",
-                    "google-chrome",
-                    "BraveSoftware",
-                ][..],
-            ),
-            ("XDG_DATA_HOME", ".local/share", &["keyrings"]),
-            ("XDG_STATE_HOME", ".local/state", &["enzui"]),
-        ] {
-            let default = home.join(default);
-            paths.extend(private.iter().map(|path| default.join(path)));
-            if let Some(active) = std::env::var_os(variable)
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute() && *path != default)
-            {
-                paths.extend(private.iter().map(|path| active.join(path)));
-            }
-        }
+        paths.extend(credential_paths(&home(), |name| std::env::var_os(name)));
         paths.extend(protected.iter().cloned());
         let configured = config.get("protected_paths").cloned().unwrap_or(json!([]));
         let configured = configured
