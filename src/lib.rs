@@ -3,6 +3,7 @@
 //! enzimos-inference-service and provider routing in enzimos-ai-gateway; the
 //! shell owns presentation.
 pub mod http_mcp;
+mod local;
 pub mod mcp;
 pub mod provider;
 pub mod runtime;

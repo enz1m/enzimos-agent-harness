@@ -35,8 +35,12 @@ Additional `protected_paths` may contain up to32 absolute paths.
 
 ## Sessions and turns
 
-- `session.create`: workspace, model, optional provider/profile. Returns session_id
-  and immutable session policy. At most16 open sessions.
+- `session.create` takes a workspace, model, and optional provider and profile.
+  An omitted or empty model with the local provider selects a model per turn
+  from the gateway's local text catalog. It uses the inference default for chat
+  and prefers the evaluated local tool model for workspace requests. An explicit
+  model pins the session. Returns the session ID and immutable session policy.
+  At most 16 sessions can be open.
 - `session.list`: stored session summaries, each with `title` (first request),
   `preview` (last reply) and `updated` (Unix seconds). `session.resume`: session_id; checks
   current policy/provider/workspace and discards incomplete tool batches.
@@ -46,7 +50,9 @@ Additional `protected_paths` may contain up to32 absolute paths.
   Stored transcripts are sensitive, bounded2MiB each, at most128 sessions.
 - `session.close`: session_id; cancel a running turn first.
 - `turn.start`: session_id, prompt, optional `skills: [{name, sha256}]` (max8).
-  Events include turn/tool started/finished, approval requested/resolved and failure.
+  Events include turn and tool lifecycle, approval requests and resolutions, and
+  failures. `turn.started` carries the model ID. `turn.local_limit` signals a
+  local context, output, or tool-loop limit, or a malformed or empty completion.
   Replies are streamed: `reasoning.delta` and `message.delta` carry `text` as it
   arrives, `reasoning.completed` carries `duration_ms`, and `message.completed`
   carries the whole `content`.
@@ -63,8 +69,11 @@ Additional `protected_paths` may contain up to32 absolute paths.
 
 A cancelled, timed-out or failed turn answers its open tool calls with a
 `tool-call-cancelled` result, so the transcript stays a valid conversation.
-Transcripts are kept within640KiB of context by dropping the oldest whole
-turns; one tool result is cut at96KiB with a `truncated` marker.
+Stored transcripts drop the oldest whole turns at 640 KiB. Before requesting
+one of the bundled local models, the harness trims old turns from the model's
+view to fit a 10 KiB request budget for messages, instructions, and schemas.
+Tool results have a 3 KiB limit for those models and a 96 KiB limit for other
+models. Cut results carry a `truncated` marker.
 
 An `approval.requested` event supplies request_id and binding plus the exact tool
 and arguments. Use `approval.resolve` with session_id, request_id, binding and

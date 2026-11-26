@@ -63,6 +63,7 @@ pub struct Service {
     config: Value,
     state: PathBuf,
     complete: Complete,
+    gateway: Option<Rc<Gateway>>,
     sessions: RefCell<HashMap<String, Shared>>,
     clients: Cell<usize>,
     active: Cell<usize>,
@@ -83,9 +84,6 @@ fn session_id(value: &Value) -> Result<String> {
         .ok_or_else(|| ToolError("invalid saved session identity".into()))
 }
 
-/// What every turn is told first: where its tools act and how to recover
-/// from a path mistake; small local models otherwise guess absolute paths or
-/// give up after one error.
 const BASE_INSTRUCTIONS: &str = "You are the enzimOS assistant, working in the folder the user chose (the workspace). \
 Use the tools to look at and change it. Paths are relative to the workspace, such as \"todo.txt\" or \"notes/plan.md\"; \
 call files_list with a null path to see what is there. When a tool reports a path error, correct the path and call it again. \
@@ -253,8 +251,8 @@ impl Service {
         protected: &[PathBuf],
     ) -> Result<Rc<Self>> {
         let state = private_directory(state)?;
-        let complete = match complete {
-            Some(complete) => complete,
+        let (complete, gateway) = match complete {
+            Some(complete) => (complete, None),
             None => {
                 let gateway = Rc::new(Gateway {
                     path: PathBuf::from(
@@ -263,11 +261,13 @@ impl Service {
                             .ok_or_else(|| ToolError("gateway socket required".into()))?,
                     ),
                 });
-                Rc::new(move |body, delta| {
-                    let gateway = gateway.clone();
+                let client = gateway.clone();
+                let complete: Complete = Rc::new(move |body, delta| {
+                    let gateway = client.clone();
                     Box::pin(async move { gateway.complete(body, delta).await })
                         as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>>>>
-                })
+                });
+                (complete, Some(gateway))
             }
         };
         let mut paths = vec![state.clone()];
@@ -289,6 +289,7 @@ impl Service {
             config,
             state,
             complete,
+            gateway,
             sessions: RefCell::new(HashMap::new()),
             clients: Cell::new(0),
             active: Cell::new(0),
@@ -391,10 +392,15 @@ impl Service {
         {
             return fail("provider not approved");
         }
-        let model = request["model"]
-            .as_str()
-            .filter(|m| (1..=128).contains(&m.chars().count()))
-            .ok_or_else(|| ToolError("invalid model identity".into()))?;
+        let model = match request.get("model") {
+            None | Some(Value::Null) if provider == "local" => "",
+            Some(Value::String(model))
+                if (provider == "local" || !model.is_empty()) && model.chars().count() <= 128 =>
+            {
+                model.as_str()
+            }
+            _ => return fail("invalid model identity"),
+        };
         let flag = |k: &str| profile.get(k).cloned().unwrap_or(json!(false));
         let policy = json!({"writes": flag("allow_writes"), "commands": flag("allow_commands"), "network": flag("allow_network")});
         let session = Session::new(
@@ -756,13 +762,39 @@ impl Service {
                         .as_str()
                         .ok_or_else(|| ToolError("invalid turn input".into()))?;
                     let active = (!mcp.schemas.borrow().is_empty()).then_some(&*mcp);
-                    runtime::run(
+                    let (automatic, task) = {
+                        let session = session.borrow();
+                        let task = if selected.is_empty() && active.is_none() {
+                            crate::local::Task::from_turn(prompt, &session.messages)
+                        } else {
+                            crate::local::Task::Full
+                        };
+                        (
+                            session.provider == "local" && session.model.is_empty(),
+                            task,
+                        )
+                    };
+                    let model = if automatic {
+                        let gateway = service
+                            .gateway
+                            .as_ref()
+                            .ok_or_else(|| ToolError("local models unavailable".into()))?;
+                        crate::local::pick_model(&gateway.local_models().await?, task)
+                            .ok_or_else(|| ToolError("local models unavailable".into()))?
+                    } else {
+                        session.borrow().model.clone()
+                    };
+                    runtime::run_configured(
                         &session,
                         prompt,
                         &service.complete,
                         active,
                         8,
-                        Some(&instructions),
+                        runtime::TurnProfile {
+                            instructions: Some(&instructions),
+                            model: &model,
+                            task,
+                        },
                     )
                     .await
                 };

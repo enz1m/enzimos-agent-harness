@@ -1,0 +1,73 @@
+{
+  "prompt": "You are the enzimOS assistant. Follow the requested format exactly. For summaries and rewrites, use only the supplied text. If information is missing, say so.",
+  "workspace": " Use relative workspace paths. Use tools for file requests. Report success only after a successful tool result.",
+  "examples": "\nTool examples: list the workspace → files_list({}); list the drafts folder → files_list({\"path\":\"drafts\"}); read report.md → file_read({\"path\":\"report.md\"}); create hello.txt with Hi → file_write({\"path\":\"hello.txt\",\"text\":\"Hi\"}). To replace a file, read it first and copy its sha256 into expected_sha256.",
+  "models": {
+    "minicpm5-1b": " Answer directly and briefly.",
+    "qwen3.5-0.8b": " Return just the requested answer.",
+    "lfm3-vl-2b": " Keep the reply concise and factual."
+  },
+  "sampling": {
+    "temperature": 0.15,
+    "top_p": 0.9,
+    "repeat_penalty": 1.03,
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "tools": [
+    {
+      "name": "files_list",
+      "description": "List a folder. Omit path for the workspace root.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "file_read",
+      "description": "Read a text file in the workspace.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "file_write",
+      "description": "Write exact text. Omit expected_sha256 to create a file. Use the sha256 from file_read to replace it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "expected_sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

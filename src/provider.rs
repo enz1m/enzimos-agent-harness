@@ -138,6 +138,7 @@ pub struct Assembler {
     reasoning: String,
     calls: Vec<Value>,
     bytes: usize,
+    output_limit: bool,
     /// The stream's end marker arrived; a stream cut short has none.
     pub done: bool,
 }
@@ -167,7 +168,9 @@ impl Assembler {
             }
             let chunk: Value = serde_json::from_str(data)
                 .map_err(|_| ToolError("invalid provider response".into()))?;
-            let delta = &chunk["choices"][0]["delta"];
+            let choice = &chunk["choices"][0];
+            self.output_limit |= choice["finish_reason"] == "length";
+            let delta = &choice["delta"];
             for key in ["reasoning_content", "reasoning"] {
                 if let Some(text) = delta[key].as_str() {
                     self.reasoning.push_str(text);
@@ -216,6 +219,9 @@ impl Assembler {
         if !self.calls.is_empty() {
             message["tool_calls"] = Value::Array(self.calls);
         }
+        if self.output_limit {
+            message["finish_reason"] = json!("length");
+        }
         message
     }
 }
@@ -259,9 +265,7 @@ pub async fn read_head<R: tokio::io::AsyncBufRead + Unpin>(
 }
 
 impl Gateway {
-    /// One completion, streamed when `body` asks for it; streamed text reaches
-    /// `delta` as it arrives. Returns the assistant message.
-    pub async fn complete(&self, body: Value, delta: Delta) -> Result<Value> {
+    async fn connect(&self) -> Result<UnixStream> {
         let info = std::fs::symlink_metadata(&self.path)
             .map_err(|_| ToolError("private owned gateway socket required".into()))?;
         let parent = self
@@ -277,17 +281,42 @@ impl Gateway {
         {
             return fail("private owned gateway socket required");
         }
+        let stream = UnixStream::connect(&self.path)
+            .await
+            .map_err(|_| ToolError("gateway unavailable".into()))?;
+        if stream.peer_cred().map(|c| c.uid()).ok() != Some(uid()) {
+            return fail("gateway peer refused");
+        }
+        Ok(stream)
+    }
+
+    pub(crate) async fn local_models(&self) -> Result<Value> {
+        let exchange = async {
+            let (reader, mut writer) = self.connect().await?.into_split();
+            writer.write_all(b"GET /v1/models?provider=local HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .map_err(|_| ToolError("gateway unavailable".into()))?;
+            let mut reader = BufReader::new(reader);
+            let (status, headers) = read_head(&mut reader).await?;
+            if status != 200 {
+                return fail("local models unavailable");
+            }
+            let data = read_body(&mut reader, &headers, LIMIT).await?;
+            serde_json::from_slice(&data).map_err(|_| ToolError("invalid model list".into()))
+        };
+        tokio::time::timeout(Duration::from_secs(15), exchange)
+            .await
+            .map_err(|_| ToolError("local models unavailable".into()))?
+    }
+
+    /// Request one completion and forward any streamed text to `delta`.
+    pub async fn complete(&self, body: Value, delta: Delta) -> Result<Value> {
         let raw = body.to_string();
         if raw.len() > LIMIT {
             return fail("provider request exceeds limit");
         }
         let exchange = async {
-            let stream = UnixStream::connect(&self.path)
-                .await
-                .map_err(|_| ToolError("gateway unavailable".into()))?;
-            if stream.peer_cred().map(|c| c.uid()).ok() != Some(uid()) {
-                return fail("gateway peer refused");
-            }
+            let stream = self.connect().await?;
             let (reader, mut writer) = stream.into_split();
             let request = format!(
                 "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{raw}",

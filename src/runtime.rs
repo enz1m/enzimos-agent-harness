@@ -2,6 +2,7 @@
 //! Sessions, exact expiring tool approvals and a provider-independent bounded tool loop.
 use crate::{
     Result, ToolError, fail,
+    local::{Profile, Task},
     mcp::Mcp,
     tools::{self, Workspace},
 };
@@ -505,6 +506,40 @@ pub async fn run(
     max_steps: usize,
     instructions: Option<&str>,
 ) -> Result<()> {
+    let model = session.borrow().model.clone();
+    run_configured(
+        session,
+        prompt,
+        complete,
+        mcp,
+        max_steps,
+        TurnProfile {
+            instructions,
+            model: &model,
+            task: Task::Full,
+        },
+    )
+    .await
+}
+
+pub(crate) struct TurnProfile<'a> {
+    pub(crate) instructions: Option<&'a str>,
+    pub(crate) model: &'a str,
+    pub(crate) task: Task,
+}
+
+pub(crate) async fn run_configured(
+    session: &Shared,
+    prompt: &str,
+    complete: &Complete,
+    mcp: Option<&Mcp>,
+    max_steps: usize,
+    TurnProfile {
+        instructions,
+        model,
+        task,
+    }: TurnProfile<'_>,
+) -> Result<()> {
     if session.borrow().turn_id.is_some() {
         return fail("session already has an active turn");
     }
@@ -514,6 +549,13 @@ pub async fn run(
     if instructions.is_some_and(|i| i.len() > 131072) {
         return fail("skill instruction context exceeds limit");
     }
+    let provider = session.borrow().provider.clone();
+    let mut tools = tools_schema();
+    if let Some(mcp) = mcp {
+        tools.extend(mcp.schemas.borrow().iter().cloned());
+    }
+    let full_tools = tools;
+    let known_local = Profile::is_builtin(&provider, model);
     {
         let mut s = session.borrow_mut();
         let mut messages = s.messages.clone();
@@ -525,31 +567,58 @@ pub async fn run(
         s.messages = messages;
         s.last_active = Instant::now();
         s.turn_id = Some(token());
-        s.emit("turn.started", json!({}));
+        s.emit("turn.started", json!({"model": model}));
     }
     let mut guard = TurnGuard {
         session: session.clone(),
         finished: false,
         started: Instant::now(),
     };
+    let mut incomplete = false;
     let steps = async {
+        let mut task = task;
         let mut seen = std::collections::HashSet::new();
         for _ in 0..max_steps {
-            let (provider, model, mut messages) = {
+            let mut messages = {
                 let mut s = session.borrow_mut();
-                s.take_steers();
+                if s.take_steers()
+                    && task != Task::Full
+                    && let Some((steer, history)) = s.messages.split_last()
+                    && let Some(text) = steer["content"].as_str()
+                {
+                    task = Task::from_turn(text, history);
+                }
                 trim(&mut s.messages, CONTEXT_LIMIT);
                 if size(&s.messages) > CONTEXT_LIMIT {
                     return fail("session context exceeds limit");
                 }
-                (s.provider.clone(), s.model.clone(), s.messages.clone())
+                s.messages.clone()
             };
+            let local = Profile::for_model(
+                &provider,
+                model,
+                task,
+                instructions.unwrap_or_default(),
+                &full_tools,
+            );
+            let (instructions, tools) = match &local {
+                Some(profile) => (
+                    Some(profile.instructions.as_str()),
+                    profile.tools.as_slice(),
+                ),
+                None => (instructions, full_tools.as_slice()),
+            };
+            if local.is_some() {
+                let overhead = instructions.map_or(0, str::len) + size(tools);
+                let limit = Profile::MESSAGE_BYTES.saturating_sub(overhead);
+                trim(&mut messages, limit);
+                if size(&messages) > limit {
+                    incomplete = true;
+                    return fail("local model context exceeded");
+                }
+            }
             if let Some(instructions) = instructions.filter(|i| !i.is_empty()) {
                 messages.insert(0, json!({"role": "system", "content": instructions}));
-            }
-            let mut tools = tools_schema();
-            if let Some(mcp) = mcp {
-                tools.extend(mcp.schemas.borrow().iter().cloned());
             }
             // Streamed text reaches the client as it arrives; reasoning is
             // closed by the first answer text or by the end of the reply.
@@ -577,9 +646,24 @@ pub async fn run(
                     }
                 })
             };
-            let message = complete(json!({"provider": provider, "model": model, "messages": messages, "tools": tools, "stream": true}), delta).await;
+            let mut request =
+                json!({"provider": provider, "model": model, "messages": messages, "stream": true});
+            if local.is_none() || !tools.is_empty() {
+                request["tools"] = json!(tools);
+            }
+            if let Some(profile) = &local {
+                request["conversation_id"] = json!(session.borrow().id);
+                if profile.tune_sampling {
+                    Profile::sample(&mut request);
+                }
+            }
+            let message = complete(request, delta).await;
             close_thinking(&mut session.borrow_mut(), &thinking);
-            let message = message?;
+            let mut message = message?;
+            incomplete |= message
+                .as_object_mut()
+                .and_then(|message| message.remove("finish_reason"))
+                .is_some_and(|reason| reason == "length");
             if message["role"] != "assistant" || message.to_string().len() > 256 * 1024 {
                 return fail("invalid provider response");
             }
@@ -609,6 +693,9 @@ pub async fn run(
                 );
             }
             if calls.is_empty() {
+                incomplete |= message["content"]
+                    .as_str()
+                    .is_none_or(|content| content.trim().is_empty());
                 // A message sent while the reply was being written gets its own answer.
                 if session.borrow().steers.is_empty() {
                     return Ok(());
@@ -623,10 +710,22 @@ pub async fn run(
                         .as_str()
                         .map(serde_json::from_str::<Value>),
                 ) {
-                    (Some(name), Some(Ok(arguments))) => {
-                        invoke(session, &call_id, name, arguments, mcp).await
+                    (Some(name), Some(Ok(Value::Object(mut arguments))))
+                        if tools.iter().any(|tool| tool["function"]["name"] == name) =>
+                    {
+                        if name == "file_write"
+                            && local
+                                .as_ref()
+                                .is_some_and(|profile| profile.optional_digest)
+                        {
+                            arguments.entry("expected_sha256").or_insert(Value::Null);
+                        }
+                        invoke(session, &call_id, name, Value::Object(arguments), mcp).await
                     }
-                    _ => fail("invalid tool request"),
+                    _ => {
+                        incomplete = true;
+                        fail("invalid tool request")
+                    }
                 };
                 let mut content = match result {
                     Ok(result) => json!({"ok": true, "result": result}).to_string(),
@@ -635,9 +734,14 @@ pub async fn run(
                 let mut s = session.borrow_mut();
                 let room = CONTEXT_LIMIT
                     .saturating_sub(size(&s.messages))
-                    .min(RESULT_LIMIT)
+                    .min(if known_local {
+                        Profile::RESULT_BYTES
+                    } else {
+                        RESULT_LIMIT
+                    })
                     .saturating_sub(256);
                 if content.len() > room {
+                    incomplete = true;
                     // Escaping can double the partial text; keep it inside the room.
                     let mut cut = room / 2;
                     while !content.is_char_boundary(cut) {
@@ -649,6 +753,7 @@ pub async fn run(
                     .push(json!({"role": "tool", "tool_call_id": call_id, "content": content}));
             }
         }
+        incomplete = true;
         fail("turn step budget exceeded")
     };
     let result = tokio::time::timeout(Duration::from_secs(600), steps)
@@ -662,6 +767,9 @@ pub async fn run(
     };
     let mut s = session.borrow_mut();
     close_batch(&mut s.messages);
+    if known_local && incomplete {
+        s.emit("turn.local_limit", json!({}));
+    }
     s.emit(
         "turn.completed",
         json!({"status": status, "duration_ms": guard.started.elapsed().as_millis() as u64}),
@@ -683,6 +791,57 @@ pub fn assistant(content: &str, calls: Vec<Value>) -> Value {
 #[cfg(test)]
 mod transcript_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_create_without_digest_cannot_replace_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("already.txt");
+        std::fs::write(&target, "original").unwrap();
+        let session = Rc::new(RefCell::new(
+            Session::new(
+                Workspace::new(dir.path(), &[]).unwrap(),
+                "local",
+                "minicpm5-1b",
+                json!({"writes": true, "commands": false, "network": false}),
+                "default",
+            )
+            .unwrap(),
+        ));
+        let complete: Complete = Rc::new(|body, _| {
+            Box::pin(async move {
+                if body["messages"].as_array().unwrap().last().unwrap()["role"] == "tool" {
+                    return Ok(assistant("Done.", vec![]));
+                }
+                let call = |id: &str, path: &str| {
+                    json!({"id": id, "type": "function", "function": {"name": "file_write",
+                        "arguments": json!({"path": path, "text": "new"}).to_string()}})
+                };
+                Ok(assistant(
+                    "",
+                    vec![call("existing", "already.txt"), call("new", "new.txt")],
+                ))
+            })
+        });
+        run_configured(
+            &session,
+            "Create new.txt and already.txt.",
+            &complete,
+            None,
+            2,
+            TurnProfile {
+                instructions: None,
+                model: "minicpm5-1b",
+                task: Task::Write,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "original");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+            "new"
+        );
+    }
 
     #[test]
     fn open_batches_are_answered_and_old_turns_trimmed_whole() {
