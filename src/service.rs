@@ -2,7 +2,7 @@
 //! Minimal private per-user service; the shell owns presentation. One JSON
 //! request line per connection; turns stream event lines until the outcome.
 use crate::{
-    Result, ToolError, fail,
+    Result, ToolError, desktop, fail,
     mcp::Mcp,
     provider::Gateway,
     runtime::{self, ApprovalMode, Complete, Session, Shared},
@@ -92,7 +92,7 @@ Answer briefly, from what the tools returned.";
 
 /// A saved transcript's title (its first request) and preview (its last
 /// reply, else its last request), each one line of plain text.
-fn headline(messages: &[Value]) -> (Option<String>, Option<String>) {
+pub(crate) fn headline(messages: &[Value]) -> (Option<String>, Option<String>) {
     let said = |role: &'static str| {
         messages
             .iter()
@@ -104,7 +104,7 @@ fn headline(messages: &[Value]) -> (Option<String>, Option<String>) {
         text.lines()
             .find(|l| !l.trim().is_empty())
             .unwrap_or("")
-            .trim_start_matches(['#', ' ', '>', '-', '*'])
+            .trim()
             .chars()
             .take(length)
             .collect::<String>()
@@ -119,6 +119,13 @@ fn headline(messages: &[Value]) -> (Option<String>, Option<String>) {
 
 /// A saved transcript as a client shows it: user and assistant text, and each
 /// tool call with its result.
+fn saved_title(body: &Value) -> Option<String> {
+    body["title"]
+        .as_str()
+        .filter(|title| !title.trim().is_empty())
+        .map(|title| title.chars().take(60).collect())
+}
+
 fn items(messages: &[Value]) -> Vec<Value> {
     let mut items = Vec::new();
     let mut calls: HashMap<String, usize> = HashMap::new();
@@ -302,7 +309,7 @@ impl Service {
 
     fn save(&self, session: &Session) -> Result<()> {
         let body = json!({"schema_version": 1, "id": session.id, "workspace": session.workspace.path, "provider": session.provider, "model": session.model,
-            "approval_mode": session.approval_mode.saved(), "messages": session.messages, "last_sequence": session.sequence, "profile": session.profile});
+            "approval_mode": session.approval_mode.saved(), "title": session.title, "messages": session.messages, "last_sequence": session.sequence, "profile": session.profile});
         let raw = body.to_string();
         if raw.len() > 2 * MAX_FRAME {
             return fail("session state exceeds limit");
@@ -489,8 +496,9 @@ impl Service {
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_secs());
-            let (title, preview) =
+            let (fallback, preview) =
                 headline(body["messages"].as_array().map_or(&[][..], Vec::as_slice));
+            let title = saved_title(&body).or(fallback);
             rows.push(json!({"id": body["id"], "workspace": body["workspace"], "provider": body["provider"], "model": body["model"], "profile": body["profile"],
                 "title": title, "preview": preview, "updated": updated}));
         }
@@ -573,6 +581,7 @@ impl Service {
             let mut s = session.borrow_mut();
             s.id = identity.clone();
             s.messages = complete[..boundary].to_vec();
+            s.title = saved_title(&body).or_else(|| headline(&s.messages).0);
             s.sequence = sequence;
             self.save(&s)?;
         }
@@ -604,7 +613,7 @@ impl Service {
                 let messages = body["messages"].as_array().map_or(&[][..], Vec::as_slice);
                 let (items, (title, _)) = (items(messages), headline(messages));
                 body["items"] = json!(items);
-                body["title"] = json!(title);
+                body["title"] = json!(saved_title(&body).or(title));
                 return Ok(body);
             }
             "session.delete" => {
@@ -911,8 +920,7 @@ impl Service {
     async fn client(self: Rc<Self>, stream: UnixStream) {
         self.clients.set(self.clients.get() + 1);
         let peer = stream.peer_cred().map(|c| c.uid()).ok();
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::with_capacity(65536, reader);
+        let mut reader = BufReader::with_capacity(65536, stream);
         let result = async {
             if self.clients.get() > 16 {
                 return fail("client limit exceeded");
@@ -938,7 +946,53 @@ impl Service {
             if request["schema_version"] != 1 || !request["schema_version"].is_u64() {
                 return fail("unsupported request version");
             }
-            if request["method"] == "turn.start" {
+            let desktop = if request["method"] == "session.desktop_control" {
+                let peer = desktop::ShellPeer::new(reader.get_ref())
+                    .ok_or_else(|| ToolError(desktop::UNAVAILABLE.into()))?;
+                Some((
+                    peer,
+                    session_id(&request["session_id"])?,
+                    session_id(&request["generation"])?,
+                ))
+            } else {
+                None
+            };
+            if !reader.buffer().is_empty() {
+                return fail("client sent excess request data");
+            }
+            Ok((request, desktop))
+        }
+        .await;
+        let (input, mut writer) = reader.into_inner().into_split();
+        let mut reader = BufReader::with_capacity(65536, input);
+        let result = async {
+            let (request, desktop) = result?;
+            if let Some((peer, id, generation)) = desktop {
+                let (session, commands) = {
+                    let sessions = self.sessions.borrow();
+                    let session = sessions
+                        .get(&id)
+                        .ok_or_else(|| ToolError(desktop::UNAVAILABLE.into()))?;
+                    let (sender, commands) = tokio::sync::mpsc::channel(1);
+                    let mut state = session.borrow_mut();
+                    if state
+                        .desktop
+                        .as_ref()
+                        .is_some_and(|active| !active.commands.is_closed())
+                    {
+                        return fail(desktop::UNAVAILABLE);
+                    }
+                    state.desktop = Some(desktop::Control {
+                        generation: generation.clone(),
+                        active: false,
+                        commands: sender,
+                    });
+                    (Rc::downgrade(session), commands)
+                };
+                Self::send(&mut writer, &json!({"ok":true, "generation":generation})).await?;
+                desktop::exchange(session, generation, reader, &mut writer, peer, commands).await;
+                Ok(())
+            } else if request["method"] == "turn.start" {
                 self.turn(&request, &mut reader, &mut writer).await
             } else {
                 let result = self.dispatch(&request)?;

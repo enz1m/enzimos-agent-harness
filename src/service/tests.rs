@@ -592,3 +592,45 @@ fn home_workspace_refuses_credentials_and_login_hooks() {
     assert_eq!(workspace.read("notes.txt").unwrap()["text"], "plain");
     assert!(protected.contains(&xdg_config.path().join("autostart")));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_send_does_not_let_an_unverified_peer_attach_desktop_control() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (fixture, seen) = start(json!({}), vec![runtime::assistant("done", vec![])]).await;
+            let id = session(&fixture).await;
+            let mode = request(
+                &fixture.socket,
+                json!({"method":"session.set_approval_mode", "session_id":id,
+            "approval_mode":"full_send", "confirm_full_send":true}),
+            )
+            .await;
+            assert_eq!(mode[0]["result"]["approval_mode"], "full_send");
+            let attachment = request(
+                &fixture.socket,
+                json!({"method":"session.desktop_control", "session_id":id,
+            "generation":"0".repeat(32)}),
+            )
+            .await;
+            assert_eq!(attachment[0]["ok"], false);
+            let turned = request(
+                &fixture.socket,
+                json!({"method":"turn.start", "session_id":id,
+            "approval_mode":"full_send", "prompt":"Click"}),
+            )
+            .await;
+            assert_eq!(turned.last().unwrap()["turn_finished"], true);
+            assert!(
+                !seen.borrow()[0]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| {
+                        tool["function"]["name"]
+                            .as_str()
+                            .is_some_and(|name| name.starts_with("computer_"))
+                    })
+            );
+        })
+        .await;
+}

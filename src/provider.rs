@@ -12,7 +12,24 @@ use tokio::{
     net::UnixStream,
 };
 
+pub(crate) const IMAGE_REJECTED: &str = "provider rejected images";
+
 const LIMIT: usize = 2 * 1024 * 1024;
+
+fn image_error(error: &Value) -> bool {
+    let message = error
+        .as_str()
+        .or_else(|| error["message"].as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mentions_images = ["image", "vision", "multimodal", "mmproj"]
+        .iter()
+        .any(|term| message.contains(term));
+    let rejects = ["support", "disabled", "unavailable", "only", "requires"]
+        .iter()
+        .any(|term| message.contains(term));
+    mentions_images && rejects
+}
 
 pub struct Gateway {
     pub path: PathBuf,
@@ -168,6 +185,13 @@ impl Assembler {
             }
             let chunk: Value = serde_json::from_str(data)
                 .map_err(|_| ToolError("invalid provider response".into()))?;
+            if let Some(error) = chunk.get("error") {
+                return fail(if image_error(error) {
+                    IMAGE_REJECTED
+                } else {
+                    "selected provider response unavailable"
+                });
+            }
             let choice = &chunk["choices"][0];
             self.output_limit |= choice["finish_reason"] == "length";
             let delta = &choice["delta"];
@@ -311,6 +335,17 @@ impl Gateway {
 
     /// Request one completion and forward any streamed text to `delta`.
     pub async fn complete(&self, body: Value, delta: Delta) -> Result<Value> {
+        let has_image = body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|message| {
+                message["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|part| part["type"] == "image_url")
+            });
         let raw = body.to_string();
         if raw.len() > LIMIT {
             return fail("provider request exceeds limit");
@@ -329,6 +364,17 @@ impl Gateway {
             let mut reader = BufReader::new(reader);
             let (status, headers) = read_head(&mut reader).await?;
             if status != 200 {
+                if has_image {
+                    if matches!(status, 400 | 415 | 422) {
+                        return fail(IMAGE_REJECTED);
+                    }
+                    if let Ok(data) = read_body(&mut reader, &headers, 32 * 1024).await
+                        && let Ok(value) = serde_json::from_slice::<Value>(&data)
+                        && image_error(&value["error"])
+                    {
+                        return fail(IMAGE_REJECTED);
+                    }
+                }
                 return fail("selected provider unavailable");
             }
             let streamed = headers
@@ -363,7 +409,10 @@ impl Gateway {
         tokio::time::timeout(Duration::from_secs(180), exchange)
             .await
             .map_err(|_| ToolError("selected provider response unavailable".into()))?
-            .map_err(|_| ToolError("selected provider response unavailable".into()))
+            .map_err(|error| match error.0.as_str() {
+                IMAGE_REJECTED => error,
+                _ => ToolError("selected provider response unavailable".into()),
+            })
     }
 }
 

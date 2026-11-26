@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Sessions, exact expiring tool approvals and a provider-independent bounded tool loop.
 use crate::{
-    Result, ToolError, fail,
+    Result, ToolError, desktop, fail,
     local::{Profile, Task},
     mcp::Mcp,
     screenshot::{self, Access},
@@ -85,6 +85,8 @@ const CORRECTABLE: &[(&str, &str)] = &[
         "workspace folder unavailable",
         "no such folder in the workspace; call files_list with a null path to see what is there",
     ),
+    (desktop::UNAVAILABLE, desktop::UNAVAILABLE),
+    (desktop::INVALID, desktop::INVALID),
     (screenshot::UNAVAILABLE, screenshot::UNAVAILABLE),
     (screenshot::UNSUPPORTED, screenshot::UNSUPPORTED),
     ("invalid screenshot target", "invalid screenshot target"),
@@ -236,6 +238,9 @@ pub struct Session {
     pub(crate) approval_mode: ApprovalMode,
     pub(crate) screenshots: Access,
     screenshot_granted: bool,
+    text_only_models: HashSet<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) desktop: Option<desktop::Control>,
     allowed_tools: HashSet<String>,
     pub profile: String,
     pub workspace: Workspace,
@@ -271,6 +276,9 @@ impl Session {
             approval_mode,
             screenshots,
             screenshot_granted: false,
+            text_only_models: HashSet::new(),
+            title: None,
+            desktop: None,
             allowed_tools: HashSet::new(),
             profile: profile.into(),
             workspace,
@@ -467,13 +475,25 @@ async fn invoke(
     arguments: Value,
     mcp: Option<&Mcp>,
     image: &mut Option<Value>,
+    model: &str,
+    desktop_generation: Option<&str>,
 ) -> Result<Value> {
     let arguments = match arguments {
         Value::Object(map) if Value::Object(map.clone()).to_string().len() <= 128 * 1024 => map,
         _ => return fail("tool arguments exceed limit"),
     };
-    let screenshots = session.borrow().screenshots;
-    let schemas = tools_schema(screenshots);
+    let screenshots = {
+        let session = session.borrow();
+        if session.screenshots == Access::Vision && session.text_only_models.contains(model) {
+            Access::Text
+        } else {
+            session.screenshots
+        }
+    };
+    let mut schemas = tools_schema(screenshots);
+    if desktop_generation.is_some() {
+        schemas.extend(desktop::schemas());
+    }
     let builtin = schemas
         .iter()
         .find(|t| t["function"]["name"] == name)
@@ -493,14 +513,16 @@ async fn invoke(
         None if mcp.is_some_and(|m| m.has(name)) => {}
         None => return fail("unknown tool"),
     }
-    let grant = match builtin {
+    let grant = match &builtin {
         Some(_) => format!("builtin:{name}"),
         None => mcp.unwrap().approval_identity(name),
     };
     let arguments_value = Value::Object(arguments.clone());
-    let needs_approval = session
-        .borrow()
-        .needs_approval(name, &arguments_value, &grant);
+    let desktop_tool = name.starts_with("computer_") && builtin.is_some();
+    let needs_approval = !desktop_tool
+        && session
+            .borrow()
+            .needs_approval(name, &arguments_value, &grant);
     let flag = |k: &str| arguments.get(k).and_then(Value::as_bool).unwrap_or(false);
     session.borrow_mut().emit(
         "tool.started",
@@ -519,6 +541,18 @@ async fn invoke(
                 .ok_or_else(|| ToolError("invalid tool request".into()))
         };
         match name {
+            name if desktop_tool => {
+                let control = session
+                    .borrow()
+                    .desktop
+                    .as_ref()
+                    .filter(|active| {
+                        active.active && Some(active.generation.as_str()) == desktop_generation
+                    })
+                    .map(|active| active.commands.clone())
+                    .ok_or_else(|| ToolError(desktop::UNAVAILABLE.into()))?;
+                desktop::invoke(control, name, arguments_value.clone()).await
+            }
             "files_list" => {
                 let path = match arguments.get("path") {
                     None | Some(Value::Null) => None,
@@ -650,6 +684,50 @@ pub async fn run(
     .await
 }
 
+async fn complete_step(
+    session: &Shared,
+    model: &str,
+    complete: &Complete,
+    mut request: Value,
+    visual: Option<Value>,
+    delta: Delta,
+) -> Result<Value> {
+    let Some(visual) = visual else {
+        return complete(request, delta).await;
+    };
+    let mut with_image = request.clone();
+    with_image["messages"].as_array_mut().unwrap().push(visual);
+    let streamed = Rc::new(std::cell::Cell::new(false));
+    let observed_delta = {
+        let (streamed, delta) = (streamed.clone(), delta.clone());
+        Rc::new(move |kind: &str, text: &str| {
+            streamed.set(true);
+            delta(kind, text);
+        })
+    };
+    match complete(with_image, observed_delta).await {
+        Err(error) if error.0 == crate::provider::IMAGE_REJECTED && !streamed.get() => {
+            let mut state = session.borrow_mut();
+            if state.text_only_models.insert(model.to_owned()) {
+                state.emit("turn.vision_fallback", json!({}));
+            }
+        }
+        result => return result,
+    }
+    for message in request["messages"].as_array_mut().unwrap() {
+        if message["role"] == "tool"
+            && let Some(content) = message["content"].as_str()
+            && content.contains("\"image_attached\"")
+            && let Ok(mut result) = serde_json::from_str::<Value>(content)
+            && result["result"]["image_attached"] == true
+        {
+            result["result"]["image_attached"] = json!(false);
+            message["content"] = json!(result.to_string());
+        }
+    }
+    complete(request, delta).await
+}
+
 pub(crate) struct TurnProfile<'a> {
     pub(crate) instructions: Option<&'a str>,
     pub(crate) model: &'a str,
@@ -699,6 +777,9 @@ pub(crate) async fn run_configured(
         if size(&messages) > CONTEXT_LIMIT {
             return fail("session context exceeds limit");
         }
+        if s.title.is_none() {
+            s.title = crate::service::headline(&messages).0;
+        }
         s.messages = messages;
         s.last_active = Instant::now();
         s.turn_id = Some(token());
@@ -737,15 +818,25 @@ pub(crate) async fn run_configured(
                 instructions.unwrap_or_default(),
                 &full_tools,
             );
-            let (instructions, tools) = match &local {
+            let (instructions, profile_tools) = match &local {
                 Some(profile) => (
                     Some(profile.instructions.as_str()),
                     profile.tools.as_slice(),
                 ),
                 None => (instructions, full_tools.as_slice()),
             };
+            let desktop_generation = session
+                .borrow()
+                .desktop
+                .as_ref()
+                .filter(|control| control.active && !control.commands.is_closed())
+                .map(|control| control.generation.clone());
+            let mut tools = profile_tools.to_vec();
+            if desktop_generation.is_some() {
+                tools.extend(desktop::schemas());
+            }
             if local.is_some() {
-                let overhead = instructions.map_or(0, str::len) + size(tools);
+                let overhead = instructions.map_or(0, str::len) + size(&tools);
                 let limit = Profile::MESSAGE_BYTES.saturating_sub(overhead);
                 trim(&mut messages, limit);
                 if size(&messages) > limit {
@@ -755,10 +846,6 @@ pub(crate) async fn run_configured(
             }
             if let Some(instructions) = instructions.filter(|i| !i.is_empty()) {
                 messages.insert(0, json!({"role": "system", "content": instructions}));
-            }
-            // Screenshot bytes belong only to the next provider request.
-            if let Some(visual) = image.take() {
-                messages.push(visual);
             }
             // Streamed text reaches the client as it arrives; reasoning is
             // closed by the first answer text or by the end of the reply.
@@ -797,7 +884,8 @@ pub(crate) async fn run_configured(
                     Profile::sample(&mut request);
                 }
             }
-            let message = complete(request, delta).await;
+            let message =
+                complete_step(session, model, complete, request, image.take(), delta).await;
             close_thinking(&mut session.borrow_mut(), &thinking);
             let mut message = message?;
             incomplete |= message
@@ -842,6 +930,7 @@ pub(crate) async fn run_configured(
                 }
                 continue;
             }
+            let mut used_desktop_tool = false;
             for (call, call_id) in calls.into_iter().zip(ids) {
                 let function = &call["function"];
                 let result = match (
@@ -860,6 +949,12 @@ pub(crate) async fn run_configured(
                         {
                             arguments.entry("expected_sha256").or_insert(Value::Null);
                         }
+                        let mut generation = desktop_generation.as_deref();
+                        if name.starts_with("computer_")
+                            && std::mem::replace(&mut used_desktop_tool, true)
+                        {
+                            generation = None;
+                        }
                         invoke(
                             session,
                             &call_id,
@@ -867,6 +962,8 @@ pub(crate) async fn run_configured(
                             Value::Object(arguments),
                             mcp,
                             &mut image,
+                            model,
+                            generation,
                         )
                         .await
                     }
@@ -939,6 +1036,121 @@ pub fn assistant(content: &str, calls: Vec<Value>) -> Value {
 #[cfg(test)]
 mod transcript_tests {
     use super::*;
+
+    fn desktop_session(dir: &std::path::Path) -> Shared {
+        Rc::new(RefCell::new(
+            Session::new(
+                Workspace::new(dir, &[]).unwrap(),
+                "local",
+                "fixture",
+                ApprovalMode::FullSend,
+                Access::Vision,
+                "default",
+            )
+            .unwrap(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn desktop_capability_requires_activation_and_the_advertised_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = desktop_session(dir.path());
+        let (sender, mut receiver) = mpsc::channel(1);
+        chat.borrow_mut().desktop = Some(desktop::Control {
+            generation: "current".into(),
+            active: false,
+            commands: sender,
+        });
+        let click = |generation| {
+            let chat = chat.clone();
+            async move {
+                invoke(
+                    &chat,
+                    "click",
+                    "computer_click",
+                    json!({"x":0.5, "y":0.5}),
+                    None,
+                    &mut None,
+                    "fixture",
+                    Some(generation),
+                )
+                .await
+            }
+        };
+        assert_eq!(click("current").await.unwrap_err().0, desktop::UNAVAILABLE);
+        chat.borrow_mut().desktop.as_mut().unwrap().active = true;
+        assert_eq!(click("previous").await.unwrap_err().0, desktop::UNAVAILABLE);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        chat.borrow_mut().desktop = None;
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn image_rejection_retries_the_description_and_reports_it_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat = desktop_session(dir.path());
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let complete: Complete = {
+            let seen = seen.clone();
+            Rc::new(move |body, _| {
+                let rejected = body["messages"].as_array().unwrap().len() == 2;
+                seen.borrow_mut().push(body);
+                Box::pin(async move {
+                    if rejected {
+                        fail(crate::provider::IMAGE_REJECTED)
+                    } else {
+                        Ok(assistant(
+                            "The screenshot description says the top is blue.",
+                            vec![],
+                        ))
+                    }
+                })
+            })
+        };
+        let request = json!({"messages":[{"role":"tool","content":json!({
+            "result":{"description":"The top is blue.","image_attached":true},
+        }).to_string()}]});
+        for _ in 0..2 {
+            let answer = complete_step(
+                &chat,
+                "fixture",
+                &complete,
+                request.clone(),
+                Some(json!({"role":"user", "content": [{"type":"image_url"}]})),
+                Rc::new(|_, _| {}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                answer["content"],
+                "The screenshot description says the top is blue."
+            );
+        }
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 4);
+        for request in [&seen[1], &seen[3]] {
+            let messages = request["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 1);
+            let result: Value =
+                serde_json::from_str(messages[0]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                result["result"],
+                json!({"description":"The top is blue.","image_attached":false})
+            );
+        }
+        let chat = chat.borrow();
+        assert!(chat.text_only_models.contains("fixture"));
+        assert_eq!(
+            chat.events
+                .iter()
+                .filter(|event| event["type"] == "turn.vision_fallback")
+                .count(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn local_create_without_digest_cannot_replace_existing_file() {
