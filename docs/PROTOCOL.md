@@ -15,17 +15,16 @@ automatically enabled. Minimal example (replace paths and model identity):
 {
   "gateway_socket": "/run/user/1000/enzimos-ai-gateway/service.sock",
   "providers": ["local"], "default_provider": "local",
-  "profiles": {"default": {"workspace_roots": ["/home/admin/Projects"],
-    "allow_writes": false, "allow_commands": false, "allow_network": false}},
+  "profiles": {"default": {"workspace_roots": ["/home/admin/Projects"]}},
+  "enzui": {"approval_default": "ask"},
   "skill_directories": ["/home/admin/.config/enzimos/skills"],
   "writable_skill_directories": ["/home/admin/.config/enzimos/skills"],
   "mcp_servers": {}
 }
 ```
 
-A profile grants only its configured roots/actions. Requests cannot expand it.
-False action defaults require an exact user approval for each action, rather than
-prohibiting the user from approving one action. Commands require Bubblewrap plus
+The selected workspace must be inside a root listed in the profile.
+Commands require Bubblewrap plus
 a systemd user scope; no fallback executes unsandboxed commands. Service state,
 Center state/credentials, SSH/GPG directories, keyrings, AI gateway and Phone Link
 state, configuration and runtime endpoints, and login hooks (shell startup files,
@@ -35,12 +34,29 @@ Additional `protected_paths` may contain up to32 absolute paths.
 
 ## Sessions and turns
 
-- `session.create` takes a workspace, model, and optional provider and profile.
-  An omitted or empty model with the local provider selects a model per turn
-  from the gateway's local text catalog. It uses the inference default for chat
-  and prefers the evaluated local tool model for workspace requests. An explicit
-  model pins the session. Returns the session ID and immutable session policy.
-  At most 16 sessions can be open.
+- `session.create`: workspace, model, optional provider, profile, approval_mode
+  and screenshots.
+  The local provider accepts an omitted or empty model. Automatic selection
+  uses the inference default for chat and prefers the evaluated local tool
+  model for workspace requests. An explicit model pins the session.
+  Returns the session ID and active settings. At most 16 sessions can be open.
+- `session.set_approval_mode`: session_id, approval_mode, and
+  `confirm_full_send: true` for Full send. Only idle sessions can change mode.
+  `ask` prompts for writes, commands, MCP and the first screenshot.
+  `workspace_edits` also permits writes through the workspace file tool.
+  `full_send` skips harness prompts. Sandbox and portal restrictions still apply.
+  `enzui.approval_default` picks the default for new sessions. A Full send
+  preference starts in Ask until explicitly confirmed through the live request.
+  Full send resumes as Ask after closing the live session.
+- `session.set_screenshots`: session_id and screenshots (`off`, `text` or
+  `vision`). Screenshots are off by default. An opt-in is live-session only.
+  Text mode sends dimensions and approximate colors. Vision also attaches a
+  bounded image to the next model request. Captured pixels are excluded from
+  the transcript. Each capture uses the desktop Screenshot portal.
+  Of the bundled local profiles, only LFM3-VL-2B advertises this tool.
+  Automatic selection prefers it while screenshots are enabled, if installed.
+  Image delivery requires an inference backend serving it with vision enabled.
+  For other providers or custom models, choose the mode their backend supports.
 - `session.list`: stored session summaries, each with `title` (first request),
   `preview` (last reply) and `updated` (Unix seconds). `session.resume`: session_id; checks
   current policy/provider/workspace and discards incomplete tool batches.
@@ -49,7 +65,9 @@ Additional `protected_paths` may contain up to32 absolute paths.
   records with tool, arguments, output and status). Delete requires a closed session.
   Stored transcripts are sensitive, bounded2MiB each, at most128 sessions.
 - `session.close`: session_id; cancel a running turn first.
-- `turn.start`: session_id, prompt, optional `skills: [{name, sha256}]` (max8).
+- `turn.start`: session_id, prompt, and optional `skills: [{name, sha256}]` (max8).
+  Supply the current approval_mode when Full send is active and the current
+  screenshots setting when enabled. If supplied, both settings must match.
   Events include turn and tool lifecycle, approval requests and resolutions, and
   failures. `turn.started` carries the model ID. `turn.local_limit` signals a
   local context, output, or tool-loop limit, or a malformed or empty completion.
@@ -65,7 +83,7 @@ Additional `protected_paths` may contain up to32 absolute paths.
   when the bounded512-event/2MiB ring no longer contains the requested history,
   and `more`: a page fits one frame, so ask again after its last sequence.
 - An idle open session is closed when a 17th is created, and `session.resume`
-  takes over an idle open session (a client that crashed never closed it).
+  returns the current settings for an idle open session.
 
 A cancelled, timed-out or failed turn answers its open tool calls with a
 `tool-call-cancelled` result, so the transcript stays a valid conversation.
@@ -77,8 +95,11 @@ models. Cut results carry a `truncated` marker.
 
 An `approval.requested` event supplies request_id and binding plus the exact tool
 and arguments. Use `approval.resolve` with session_id, request_id, binding and
-boolean allow. Wrong/stale/repeated bindings are rejected; approvals expire90s and
-never survive restart. Clients must show the actual action before approving.
+boolean allow. With `remember: true` and `allow: true`, subsequent calls of that
+tool may use any accepted arguments during the live session. A successful
+screenshot also covers subsequent screenshots in that session. Changing modes
+clears live grants. Wrong, stale and repeated bindings are rejected. Pending
+approvals expire in 90 seconds. Clients must show the actual action before approving.
 No automated permission acceptance is provided by the CLI.
 
 Sessions are saved after turns. An abrupt crash can lose in-flight conversation;
@@ -102,7 +123,7 @@ transport:"http", url:"https://...", authorization:"Bearer ..."}`. HTTP on liter
 loopback is allowed for local services; verified HTTPS is otherwise required.
 Secrets belong in the private config, never skill text/argv supplied by a model.
 Stdio executables are trusted configuration and run with the user's authority,
-not within the command sandbox. Every MCP call also requires harness approval.
+not within the command sandbox. The conversation’s approval mode governs harness approval.
 
 Center configuration uses `/usr/bin/enzui-mcp --credential /private/agent.json
 --socket /run/user/1000/enzui/center.sock`. Enroll this identity explicitly through

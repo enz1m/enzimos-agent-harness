@@ -236,6 +236,10 @@ impl Workspace {
         Ok((current, pieces[pieces.len() - 1].to_owned()))
     }
 
+    pub(crate) fn contains_write_path(&self, path: &str) -> bool {
+        self.parent(path).is_ok()
+    }
+
     pub fn read(&self, relative: &str) -> Result<Value> {
         let (parent, name) = self.parent(relative)?;
         read_at(&parent, &name).map(|(_, value)| value)

@@ -5,7 +5,8 @@ use crate::{
     Result, ToolError, fail,
     mcp::Mcp,
     provider::Gateway,
-    runtime::{self, Complete, Session, Shared},
+    runtime::{self, ApprovalMode, Complete, Session, Shared},
+    screenshot::Access,
     skills::Skills,
     tools::Workspace,
     uid,
@@ -261,9 +262,9 @@ impl Service {
                             .ok_or_else(|| ToolError("gateway socket required".into()))?,
                     ),
                 });
-                let client = gateway.clone();
+                let client = Rc::clone(&gateway);
                 let complete: Complete = Rc::new(move |body, delta| {
-                    let gateway = client.clone();
+                    let gateway = Rc::clone(&client);
                     Box::pin(async move { gateway.complete(body, delta).await })
                         as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>>>>
                 });
@@ -301,7 +302,7 @@ impl Service {
 
     fn save(&self, session: &Session) -> Result<()> {
         let body = json!({"schema_version": 1, "id": session.id, "workspace": session.workspace.path, "provider": session.provider, "model": session.model,
-            "policy": session.policy, "messages": session.messages, "last_sequence": session.sequence, "profile": session.profile});
+            "approval_mode": session.approval_mode.saved(), "messages": session.messages, "last_sequence": session.sequence, "profile": session.profile});
         let raw = body.to_string();
         if raw.len() > 2 * MAX_FRAME {
             return fail("session state exceeds limit");
@@ -401,13 +402,23 @@ impl Service {
             }
             _ => return fail("invalid model identity"),
         };
-        let flag = |k: &str| profile.get(k).cloned().unwrap_or(json!(false));
-        let policy = json!({"writes": flag("allow_writes"), "commands": flag("allow_commands"), "network": flag("allow_network")});
+        let approval_mode = match request.get("approval_mode") {
+            Some(value) => ApprovalMode::parse(value)?,
+            None => match ApprovalMode::parse(&self.config["enzui"]["approval_default"]) {
+                Ok(ApprovalMode::WorkspaceEdits) => ApprovalMode::WorkspaceEdits,
+                _ => ApprovalMode::Ask,
+            },
+        };
+        if approval_mode == ApprovalMode::FullSend {
+            return fail("set full send on an open session with explicit confirmation");
+        }
+        let screenshots = Access::parse(request.get("screenshots"))?;
         let session = Session::new(
             Workspace::new(&workspace, &self.protected)?,
             &provider,
             model,
-            policy.clone(),
+            approval_mode,
+            screenshots,
             &profile_name,
         )?;
         self.save(&session)?;
@@ -415,7 +426,9 @@ impl Service {
         self.sessions
             .borrow_mut()
             .insert(id.clone(), Rc::new(RefCell::new(session)));
-        Ok(json!({"session_id": id, "policy": policy}))
+        Ok(
+            json!({"session_id": id, "approval_mode": approval_mode.wire(), "screenshots": screenshots.wire()}),
+        )
     }
 
     fn stored(&self, identity: &Value) -> Result<Value> {
@@ -492,8 +505,10 @@ impl Service {
             if open.borrow().task.is_some() || self.busy.borrow().contains(&identity) {
                 return fail("session already open");
             }
+            return Ok(
+                json!({"session_id": identity, "approval_mode": open.borrow().approval_mode.wire(), "screenshots": open.borrow().screenshots.wire()}),
+            );
         }
-        self.sessions.borrow_mut().remove(&identity);
         let body = self.stored(&json!(identity))?;
         let messages = body["messages"]
             .as_array()
@@ -549,7 +564,8 @@ impl Service {
                 boundary = complete.len();
             }
         }
-        let created = self.create(&json!({"workspace": body["workspace"], "provider": body["provider"], "model": body["model"], "profile": body["profile"]}))?;
+        let created = self.create(&json!({"workspace": body["workspace"], "provider": body["provider"], "model": body["model"], "profile": body["profile"],
+            "approval_mode": ApprovalMode::parse(&body["approval_mode"]).unwrap_or_default().saved()}))?;
         let temporary_id = created["session_id"].as_str().unwrap().to_owned();
         let session = self.sessions.borrow_mut().remove(&temporary_id).unwrap();
         let _ = std::fs::remove_file(self.state.join(format!("{temporary_id}.json")));
@@ -560,10 +576,10 @@ impl Service {
             s.sequence = sequence;
             self.save(&s)?;
         }
-        let policy = session.borrow().policy.clone();
+        let approval_mode = session.borrow().approval_mode.wire();
         self.sessions.borrow_mut().insert(identity.clone(), session);
         Ok(
-            json!({"session_id": identity, "policy": policy, "messages": boundary, "discarded_incomplete_messages": messages.len() - boundary}),
+            json!({"session_id": identity, "approval_mode": approval_mode, "messages": boundary, "discarded_incomplete_messages": messages.len() - boundary}),
         )
     }
 
@@ -665,11 +681,34 @@ impl Service {
                     json!({"events": events, "gap": first.is_some_and(|f| cursor + 1 < f), "more": more, "last_sequence": s.sequence}),
                 )
             }
+            "session.set_approval_mode" => {
+                if self.busy.borrow().contains(id) {
+                    return fail("stop the turn before changing approval mode");
+                }
+                let mode = ApprovalMode::parse(&request["approval_mode"])?;
+                let mut s = session.borrow_mut();
+                let previous = s.approval_mode;
+                s.configure_mode(mode, request["confirm_full_send"] == true)?;
+                if let Err(error) = self.save(&s) {
+                    s.approval_mode = previous;
+                    return Err(error);
+                }
+                Ok(json!({"approval_mode": mode.wire()}))
+            }
+            "session.set_screenshots" => {
+                if self.busy.borrow().contains(id) {
+                    return fail("stop the turn before changing screenshot access");
+                }
+                let access = Access::parse(request.get("screenshots"))?;
+                session.borrow_mut().set_screenshots(access);
+                Ok(json!({"screenshots": access.wire()}))
+            }
             "approval.resolve" => {
                 session.borrow_mut().resolve(
                     Self::text(request, "request_id")?,
                     Self::text(request, "binding")?,
                     &request["allow"],
+                    request.get("remember"),
                 )?;
                 Ok(json!({"resolved": true}))
             }
@@ -720,6 +759,15 @@ impl Service {
         }) else {
             return fail("session unavailable or service busy");
         };
+        let active_mode = session.borrow().approval_mode;
+        match request.get("approval_mode") {
+            Some(mode) if ApprovalMode::parse(mode)? == active_mode => {}
+            None if active_mode != ApprovalMode::FullSend => {}
+            _ => return fail("approval mode changed; reopen the conversation"),
+        }
+        if Access::parse(request.get("screenshots"))? != session.borrow().screenshots {
+            return fail("screenshot access changed; reopen the conversation");
+        }
         // Fallible setup runs before the session is marked busy.
         let mcp = Rc::new(Mcp::new(
             self.config.get("mcp_servers").cloned().unwrap_or(json!({})),
@@ -762,7 +810,7 @@ impl Service {
                         .as_str()
                         .ok_or_else(|| ToolError("invalid turn input".into()))?;
                     let active = (!mcp.schemas.borrow().is_empty()).then_some(&*mcp);
-                    let (automatic, task) = {
+                    let (automatic, task, screenshots) = {
                         let session = session.borrow();
                         let task = if selected.is_empty() && active.is_none() {
                             crate::local::Task::from_turn(prompt, &session.messages)
@@ -772,6 +820,7 @@ impl Service {
                         (
                             session.provider == "local" && session.model.is_empty(),
                             task,
+                            session.screenshots,
                         )
                     };
                     let model = if automatic {
@@ -779,8 +828,12 @@ impl Service {
                             .gateway
                             .as_ref()
                             .ok_or_else(|| ToolError("local models unavailable".into()))?;
-                        crate::local::pick_model(&gateway.local_models().await?, task)
-                            .ok_or_else(|| ToolError("local models unavailable".into()))?
+                        crate::local::pick_model(
+                            &gateway.local_models().await?,
+                            task,
+                            screenshots != Access::Off,
+                        )
+                        .ok_or_else(|| ToolError("local models unavailable".into()))?
                     } else {
                         session.borrow().model.clone()
                     };
@@ -807,6 +860,12 @@ impl Service {
         let mut task = task;
         let outcome = loop {
             tokio::select! {
+                biased;
+                _ = reader.read_u8() => {
+                    task.abort();
+                    let _ = (&mut task).await;
+                    break None;
+                }
                 result = &mut task => break Some(result),
                 event = events.recv() => {
                     if let Some(event) = event
@@ -815,12 +874,6 @@ impl Service {
                             let _ = (&mut task).await;
                             break None;
                         }
-                }
-                _ = reader.read_u8() => {
-                    // The client disconnecting cancels the turn.
-                    task.abort();
-                    let _ = (&mut task).await;
-                    break None;
                 }
             }
         };

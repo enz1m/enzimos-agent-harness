@@ -7,6 +7,7 @@ mod local;
 pub mod mcp;
 pub mod provider;
 pub mod runtime;
+mod screenshot;
 pub mod service;
 pub mod skills;
 pub mod tools;

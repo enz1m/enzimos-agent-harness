@@ -40,7 +40,9 @@ async fn start_with(profile: Value, complete: Complete) -> Fixture {
     let (state, run, workspace) = (private(), private(), tempfile::tempdir().unwrap());
     let mut profile = profile;
     profile["workspace_roots"] = json!([workspace.path()]);
-    let config = json!({"providers": ["local"], "profiles": {"default": profile}});
+    let approval_default = profile.as_object_mut().unwrap().remove("approval_default");
+    let config = json!({"providers": ["local"], "profiles": {"default": profile},
+        "enzui": {"approval_default": approval_default}});
     let service = Service::new(config, state.path(), Some(complete), &[]).unwrap();
     let socket = run.path().join("harness.sock");
     let listener = bind(&socket).unwrap();
@@ -70,9 +72,13 @@ async fn request(socket: &Path, body: Value) -> Vec<Value> {
 }
 
 async fn session(fixture: &Fixture) -> String {
+    session_with_model(fixture, "m").await
+}
+
+async fn session_with_model(fixture: &Fixture, model: &str) -> String {
     let created = request(
         &fixture.socket,
-        json!({"method": "session.create", "workspace": fixture.workspace.path(), "model": "m"}),
+        json!({"method": "session.create", "workspace": fixture.workspace.path(), "model": model}),
     )
     .await;
     created[0]["result"]["session_id"]
@@ -194,17 +200,19 @@ async fn writes_need_an_exact_unexpired_approval() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let replies = vec![
-                runtime::assistant("", vec![call("w1", "file_write", json!({"path": "new.txt", "text": "hi", "expected_sha256": null}))]),
+                runtime::assistant("", vec![call("w1", "file_write", json!({"path": "new.txt", "text": "hi"}))]),
                 runtime::assistant("ok", vec![]),
             ];
-            let (fixture, _) = start(json!({}), replies).await;
-            let id = session(&fixture).await;
+            let (fixture, seen) = start(json!({}), replies).await;
+            let id = session_with_model(&fixture, "minicpm5-1b").await;
             let socket = fixture.socket.clone();
             let turn = tokio::task::spawn_local({
                 let id = id.clone();
-                async move { request(&socket, json!({"method": "turn.start", "session_id": id, "prompt": "write"})).await }
+                async move { request(&socket, json!({"method": "turn.start", "session_id": id, "prompt": "write new.txt"})).await }
             });
-            let pending = approval_requested(&fixture, &id).await;
+            let pending = tokio::time::timeout(Duration::from_secs(3), approval_requested(&fixture, &id)).await.unwrap();
+            assert_eq!(pending["arguments"], json!({"path": "new.txt", "text": "hi", "expected_sha256": null}));
+            assert_eq!(seen.borrow()[0]["tools"].as_array().unwrap().len(), 3);
             let wrong = request(&fixture.socket, json!({"method": "approval.resolve", "session_id": id, "request_id": pending["request_id"], "binding": "0".repeat(64), "allow": true})).await;
             assert_eq!(wrong[0]["ok"], false);
             assert!(!fixture.workspace.path().join("new.txt").exists());
@@ -213,6 +221,112 @@ async fn writes_need_an_exact_unexpired_approval() {
             let frames = turn.await.unwrap();
             assert_eq!(frames.last().unwrap()["turn_finished"], true);
             assert_eq!(std::fs::read_to_string(fixture.workspace.path().join("new.txt")).unwrap(), "hi");
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn broad_approvals_require_live_consent_and_keep_workspace_boundaries() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let write = |id: &str, path: &str| call(
+                id, "file_write", json!({"path": path, "text": id})
+            );
+            let (fixture, _) = start(json!({"approval_default": "full_send", "allow_writes": true}), vec![
+                runtime::assistant("", vec![write("w1", "with-consent"), write("w2", "with-grant")]),
+                runtime::assistant("done", vec![]),
+                runtime::assistant("", vec![write("w3", "auto-edit"), write("w4", "../outside")]),
+                runtime::assistant("done", vec![]),
+                runtime::assistant("", vec![write("w5", "../outside")]),
+                runtime::assistant("done", vec![]),
+            ]).await;
+            let id = session_with_model(&fixture, "minicpm5-1b").await;
+            let send = |body| request(&fixture.socket, body);
+            for (confirmed, expected) in [(false, false), (true, true)] {
+                let result = send(json!({"method": "session.set_approval_mode", "session_id": id,
+                    "approval_mode": "full_send", "confirm_full_send": confirmed})).await;
+                assert_eq!(result[0]["ok"], expected);
+            }
+            let result = send(json!({"method": "turn.start", "session_id": id, "prompt": "no mode acknowledgement"})).await;
+            assert_eq!(result[0]["ok"], false);
+            assert_eq!(send(json!({"method": "session.close", "session_id": id})).await[0]["ok"], true);
+            let resumed = send(json!({"method": "session.resume", "session_id": id})).await;
+            assert_eq!(resumed[0]["result"]["approval_mode"], "ask");
+
+            let turn_request = |id: &str, mode| {
+                let body = json!({"method":"turn.start", "session_id":id, "approval_mode": mode, "prompt":"write files in the workspace"});
+                let socket = fixture.socket.clone();
+                tokio::task::spawn_local(async move { request(&socket, body).await })
+            };
+            let turn = turn_request(&id, "ask");
+            let pending = tokio::time::timeout(Duration::from_secs(3), approval_requested(&fixture, &id)).await.unwrap();
+            let allow = send(json!({"method":"approval.resolve", "session_id":id,
+                "request_id":pending["request_id"], "binding":pending["binding"], "allow":true, "remember":true})).await;
+            assert_eq!(allow[0]["ok"], true);
+            let frames = tokio::time::timeout(Duration::from_secs(3), turn).await.unwrap().unwrap();
+            assert_eq!(frames.iter().filter(|f| f["event"]["type"] == "approval.requested").count(), 1);
+            for (file, content) in [("with-consent", "w1"), ("with-grant", "w2")] {
+                assert_eq!(std::fs::read_to_string(fixture.workspace.path().join(file)).unwrap(), content);
+            }
+
+            let edited = send(json!({"method":"session.create", "workspace":fixture.workspace.path(),
+                "model":"minicpm5-1b", "approval_mode":"workspace_edits"})).await;
+            let edited = edited[0]["result"]["session_id"].as_str().unwrap();
+            let turn = turn_request(edited, "workspace_edits");
+            let pending = tokio::time::timeout(Duration::from_secs(3), approval_requested(&fixture, edited)).await.unwrap();
+            assert_eq!(pending["call_id"], "w4");
+            assert_eq!(std::fs::read_to_string(fixture.workspace.path().join("auto-edit")).unwrap(), "w3");
+            send(json!({"method":"approval.resolve", "session_id":edited,
+                "request_id":pending["request_id"], "binding":pending["binding"], "allow":false})).await;
+            assert_eq!(turn.await.unwrap().last().unwrap()["turn_finished"], true);
+
+            assert_eq!(send(json!({"method": "session.set_approval_mode", "session_id": edited,
+                "approval_mode": "full_send", "confirm_full_send": true})).await[0]["ok"], true);
+            let frames = tokio::time::timeout(Duration::from_secs(3), turn_request(edited, "full_send")).await.unwrap().unwrap();
+            assert!(!frames.iter().any(|f| f["event"]["type"] == "approval.requested"));
+            assert!(frames.iter().any(|f| f["event"]["type"] == "tool.completed" && f["event"]["status"] == "failed"));
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn screenshot_access_is_explicit_and_reviewed_in_the_current_session() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let shot = || runtime::assistant("", vec![call("shot", "screenshot", json!({"target": "screen"}))]);
+            let (fixture, seen) = start(json!({}), vec![runtime::assistant("done", vec![]), shot(), runtime::assistant("done", vec![]), shot()]).await;
+            let text_session = session_with_model(&fixture, "minicpm5-1b").await;
+            let id = session_with_model(&fixture, "lfm3-vl-2b").await;
+            let turn = |id: &str, mode, prompt| json!({"method":"turn.start", "session_id":id, "screenshots":mode, "prompt":prompt});
+            let enabled = request(&fixture.socket, json!({"method":"session.set_screenshots", "session_id":text_session, "screenshots":"vision"})).await;
+            assert_eq!(enabled[0]["ok"], true);
+            let frames = request(&fixture.socket, turn(&text_session, "vision", "List the workspace")).await;
+            assert_eq!(frames.last().unwrap()["turn_finished"], true);
+            let advertised = |index: usize| seen.borrow()[index]["tools"].as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["function"]["name"] == "screenshot"));
+            assert!(!advertised(0));
+            let frames = request(&fixture.socket, turn(&id, "off", "look")).await;
+            assert_eq!(frames.last().unwrap()["turn_finished"], true);
+            assert!(!advertised(1));
+
+            let opt_in = request(&fixture.socket, json!({"method":"session.set_screenshots", "session_id":id, "screenshots":"vision"})).await;
+            assert_eq!(opt_in[0]["result"]["screenshots"], "vision");
+            let socket = fixture.socket.clone();
+            let turn = turn(&id, "vision", "take a screenshot");
+            let live = tokio::task::spawn_local(async move { request(&socket, turn).await });
+            let pending = tokio::time::timeout(Duration::from_secs(3), approval_requested(&fixture, &id)).await.unwrap();
+            assert_eq!(pending["tool"], "screenshot");
+            assert!(advertised(3));
+            let revoke = request(&fixture.socket, json!({"method":"session.set_screenshots", "session_id":id, "screenshots":"off"})).await;
+            assert_eq!(revoke[0]["ok"], false);
+            request(&fixture.socket, json!({"method":"turn.cancel", "session_id":id})).await;
+            assert_eq!(live.await.unwrap().last().unwrap()["status"], "cancelled");
+            let revoke = request(&fixture.socket, json!({"method":"session.set_screenshots", "session_id":id, "screenshots":"off"})).await;
+            assert_eq!(revoke[0]["result"]["screenshots"], "off");
+
+            let late = request(&fixture.socket, json!({"method":"approval.resolve", "session_id":id,
+                "request_id":pending["request_id"], "binding":pending["binding"], "allow":true, "remember":true})).await;
+            assert_eq!(late[0]["ok"], false);
         })
         .await;
 }

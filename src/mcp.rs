@@ -235,6 +235,7 @@ pub struct Mcp {
     clients: RefCell<Vec<Rc<Client>>>,
     routes: RefCell<BTreeMap<String, (Rc<Client>, String)>>,
     pub schemas: RefCell<Vec<Value>>,
+    approval_identities: RefCell<BTreeMap<String, String>>,
 }
 
 fn server_name(name: &str) -> bool {
@@ -262,11 +263,16 @@ impl Mcp {
             clients: RefCell::new(vec![]),
             routes: RefCell::new(BTreeMap::new()),
             schemas: RefCell::new(vec![]),
+            approval_identities: RefCell::default(),
         })
     }
 
     pub fn has(&self, alias: &str) -> bool {
         self.routes.borrow().contains_key(alias)
+    }
+
+    pub(crate) fn approval_identity(&self, alias: &str) -> String {
+        self.approval_identities.borrow()[alias].clone()
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -409,6 +415,11 @@ impl Mcp {
                     .map(|d| d.as_str().map_or_else(|| d.to_string(), str::to_owned))
                     .unwrap_or_default();
                 let description = description.chars().take(1024).collect::<String>();
+                let identity =
+                    crate::runtime::fingerprint(&json!([name, original, schema, description]));
+                self.approval_identities
+                    .borrow_mut()
+                    .insert(alias.clone(), format!("mcp:{identity}"));
                 self.routes
                     .borrow_mut()
                     .insert(alias.clone(), (client.clone(), original));
@@ -436,5 +447,6 @@ impl Mcp {
         }
         self.routes.borrow_mut().clear();
         self.schemas.borrow_mut().clear();
+        self.approval_identities.borrow_mut().clear();
     }
 }

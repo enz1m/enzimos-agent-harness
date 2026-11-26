@@ -40,8 +40,10 @@ start it with `systemctl --user start enzimos-agent-harness.service`.
 The harness can read and list workspace files, propose file replacements, and
 run commands in a Bubblewrap sandbox with a systemd user scope for memory, CPU
 and process limits. Commands require both. The sandbox excludes the host home,
-credentials and graphical session bus. Approvals apply to a specific action
-and expire. Cancelling or disconnecting ends the turn and its tool processes.
+credentials and graphical session bus. Ask every time binds each prompted
+approval to one exact action. You can allow a tool for the live session,
+auto-approve workspace file edits or explicitly confirm Full send. The same
+workspace and sandbox restrictions apply in every mode. Cancelling or disconnecting ends the turn and its tool processes.
 
 Before replacing a file, the harness checks its identity and contents again.
 It retains the original file as a `.agent-backup-*` entry with its existing
@@ -56,6 +58,16 @@ Pending approvals expire on restart. Transcripts contain prompts and tool
 results, so treat them as private. The socket and files are accessible to local
 processes running as your user.
 
+## Screenshots
+
+Enable screenshots for a live conversation to expose the screenshot tool.
+The first capture requires approval unless Full send is active. The desktop
+Screenshot portal separately decides whether it can capture the request.
+Choose text summaries or enable image delivery for a vision-capable backend.
+Among the bundled local profiles, LFM3-VL-2B exposes the screenshot tool and
+becomes the first choice for automatic sessions with screenshots enabled.
+Images go to the conversation’s provider and stay out of the saved transcript.
+
 ## Skills and MCP
 
 Skills add instructions to a turn. The harness checks the selected skill
@@ -65,7 +77,7 @@ permissions after loading a skill.
 Enable MCP servers explicitly in the private configuration. The harness
 supports stdio and Streamable HTTP over verified HTTPS or literal loopback
 HTTP. Stdio executables run as your user, outside the command sandbox. External
-tool calls require harness approval. When using MCP Center, its enrollment and
+tool calls follow the conversation’s approval mode. When using MCP Center, its enrollment and
 app consent rules also apply. See the [protocol guide](docs/PROTOCOL.md) for
 configuration, tool discovery limits, cancellation and handling lost responses.
 

@@ -118,6 +118,7 @@ impl Profile {
     // Leave room for template framing and output in the runtime’s 4,608-token default context.
     pub(crate) const MESSAGE_BYTES: usize = 10 * 1024;
     pub(crate) const RESULT_BYTES: usize = 3 * 1024;
+    pub(crate) const VISION_MODEL: &str = "lfm3-vl-2b";
 
     pub(crate) fn is_builtin(provider: &str, model: &str) -> bool {
         provider == "local" && PROFILES["models"].get(model).is_some()
@@ -143,7 +144,7 @@ impl Profile {
             });
         }
         let mut instructions = format!("{}{model_prompt}", PROFILES["prompt"].as_str()?);
-        let tools = match task {
+        let mut tools = match task {
             Task::Text => Vec::new(),
             Task::Files | Task::Write => {
                 instructions.push_str(PROFILES["workspace"].as_str()?);
@@ -160,6 +161,14 @@ impl Profile {
                 full_tools.to_vec()
             }
         };
+        if task != Task::Full && model == Self::VISION_MODEL {
+            tools.extend(
+                full_tools
+                    .iter()
+                    .filter(|tool| tool["function"]["name"] == "screenshot")
+                    .cloned(),
+            );
+        }
         Some(Self {
             instructions,
             tools,
@@ -177,14 +186,21 @@ impl Profile {
     }
 }
 
-pub(crate) fn pick_model(catalog: &Value, task: Task) -> Option<String> {
+pub(crate) fn pick_model(catalog: &Value, task: Task, prefer_vision: bool) -> Option<String> {
     let models = catalog["data"].as_array()?;
     let text_models = models.iter().filter(|model| model["kind"] == "llm");
+    if prefer_vision
+        && text_models
+            .clone()
+            .any(|model| model["id"] == Profile::VISION_MODEL)
+    {
+        return Some(Profile::VISION_MODEL.to_owned());
+    }
     let id = |entry: &Value| entry["id"].as_str().map(str::to_owned);
     let workspace = if task == Task::Text {
         None
     } else {
-        ["lfm3-vl-2b", "qwen3.5-0.8b", "minicpm5-1b"]
+        [Profile::VISION_MODEL, "qwen3.5-0.8b", "minicpm5-1b"]
             .into_iter()
             .find(|name| text_models.clone().any(|model| model["id"] == *name))
             .map(str::to_owned)
@@ -211,12 +227,25 @@ mod tests {
             {"id": "dictation", "kind": "speech", "default": true}
         ]});
         assert_eq!(
-            pick_model(&catalog, Task::Text).as_deref(),
+            pick_model(&catalog, Task::Text, true).as_deref(),
             Some("minicpm5-1b")
         );
         assert_eq!(
-            pick_model(&catalog, Task::Files).as_deref(),
+            pick_model(&catalog, Task::Files, false).as_deref(),
             Some("qwen3.5-0.8b")
+        );
+        let mut catalog = catalog;
+        catalog["data"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": Profile::VISION_MODEL, "kind": "llm"}));
+        assert_eq!(
+            pick_model(&catalog, Task::Text, true).as_deref(),
+            Some(Profile::VISION_MODEL)
+        );
+        assert_eq!(
+            pick_model(&catalog, Task::Text, false).as_deref(),
+            Some("minicpm5-1b")
         );
     }
 

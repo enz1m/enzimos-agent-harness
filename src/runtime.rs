@@ -4,12 +4,13 @@ use crate::{
     Result, ToolError, fail,
     local::{Profile, Task},
     mcp::Mcp,
+    screenshot::{self, Access},
     tools::{self, Workspace},
 };
 use serde_json::{Map, Value, json};
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
     rc::Rc,
@@ -22,12 +23,12 @@ pub use crate::provider::Delta;
 /// One provider completion: the request body and where streamed text goes.
 pub type Complete = Rc<dyn Fn(Value, Delta) -> Pin<Box<dyn Future<Output = Result<Value>>>>>;
 
-pub fn tools_schema() -> Vec<Value> {
+fn tools_schema(screenshots: Access) -> Vec<Value> {
     let tool = |name: &str, description: &str, properties: Value, required: Value| {
         json!({"type": "function", "function": {"name": name, "description": description,
             "parameters": {"type": "object", "properties": properties, "required": required, "additionalProperties": false}}})
     };
-    vec![
+    let mut tools = vec![
         tool(
             "files_list",
             "List one folder of the workspace without following symlinks. `path` is a folder inside the workspace; null lists the workspace itself.",
@@ -52,7 +53,16 @@ pub fn tools_schema() -> Vec<Value> {
             json!({"argv": {"type": "array", "items": {"type": "string"}}, "writable": {"type": "boolean"}, "network": {"type": "boolean"}}),
             json!(["argv"]),
         ),
-    ]
+    ];
+    if screenshots != Access::Off {
+        tools.push(tool(
+            "screenshot",
+            "Capture the desktop or the focused window through the desktop portal. If the portal lacks focused-window support, ask the user before capturing the whole screen.",
+            json!({"target": {"type":"string", "enum":["screen","focused_window"]}}),
+            json!(["target"]),
+        ));
+    }
+    tools
 }
 
 /// Tool failures a model can act on are told to it as they are; any other
@@ -74,6 +84,13 @@ const CORRECTABLE: &[(&str, &str)] = &[
     (
         "workspace folder unavailable",
         "no such folder in the workspace; call files_list with a null path to see what is there",
+    ),
+    (screenshot::UNAVAILABLE, screenshot::UNAVAILABLE),
+    (screenshot::UNSUPPORTED, screenshot::UNSUPPORTED),
+    ("invalid screenshot target", "invalid screenshot target"),
+    (
+        "one screenshot per model step",
+        "one screenshot per model step",
     ),
     ("file exceeds limit", "file exceeds limit"),
     ("folder exceeds entry limit", "folder exceeds entry limit"),
@@ -160,8 +177,53 @@ pub fn token() -> String {
     enzimos_platform::files::random_hex(16).unwrap_or_default()
 }
 
+/// Controls when a live session asks before executing a tool.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ApprovalMode {
+    /// Review each tool call that can change state or reach outside the workspace.
+    #[default]
+    Ask,
+    /// Permit writes through the workspace file tool.
+    WorkspaceEdits,
+    /// Skip harness approvals while keeping tool boundaries.
+    FullSend,
+}
+
+impl ApprovalMode {
+    pub(crate) fn parse(value: &Value) -> Result<Self> {
+        match value.as_str() {
+            Some("ask") => Ok(Self::Ask),
+            Some("workspace_edits") => Ok(Self::WorkspaceEdits),
+            Some("full_send") => Ok(Self::FullSend),
+            _ => fail("invalid approval mode"),
+        }
+    }
+
+    pub(crate) fn wire(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::WorkspaceEdits => "workspace_edits",
+            Self::FullSend => "full_send",
+        }
+    }
+
+    pub(crate) fn saved(self) -> &'static str {
+        match self {
+            Self::FullSend => Self::Ask.wire(),
+            mode => mode.wire(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ApprovalDecision {
+    Deny,
+    Once,
+    Session,
+}
+
 struct Pending {
-    sender: Option<oneshot::Sender<bool>>,
+    sender: Option<oneshot::Sender<ApprovalDecision>>,
     binding: String,
     turn_id: Option<String>,
     expires: Instant,
@@ -171,7 +233,10 @@ pub struct Session {
     pub id: String,
     pub provider: String,
     pub model: String,
-    pub policy: Value,
+    pub(crate) approval_mode: ApprovalMode,
+    pub(crate) screenshots: Access,
+    screenshot_granted: bool,
+    allowed_tools: HashSet<String>,
     pub profile: String,
     pub workspace: Workspace,
     pub messages: Vec<Value>,
@@ -191,24 +256,22 @@ pub struct Session {
 pub type Shared = Rc<RefCell<Session>>;
 
 impl Session {
-    pub fn new(
+    pub(crate) fn new(
         workspace: Workspace,
         provider: &str,
         model: &str,
-        policy: Value,
+        approval_mode: ApprovalMode,
+        screenshots: Access,
         profile: &str,
     ) -> Result<Self> {
-        if !["writes", "commands", "network"]
-            .iter()
-            .all(|k| policy[*k].is_boolean())
-        {
-            return fail("invalid session policy");
-        }
         Ok(Self {
             id: token(),
             provider: provider.into(),
             model: model.into(),
-            policy,
+            approval_mode,
+            screenshots,
+            screenshot_granted: false,
+            allowed_tools: HashSet::new(),
             profile: profile.into(),
             workspace,
             messages: vec![],
@@ -275,10 +338,19 @@ impl Session {
         !steers.is_empty()
     }
 
-    pub fn resolve(&mut self, request_id: &str, binding: &str, allow: &Value) -> Result<()> {
-        let allow = allow
-            .as_bool()
-            .ok_or_else(|| ToolError("stale or mismatched approval".into()))?;
+    pub fn resolve(
+        &mut self,
+        request_id: &str,
+        binding: &str,
+        allow: &Value,
+        remember: Option<&Value>,
+    ) -> Result<()> {
+        let decision = match (allow.as_bool(), remember) {
+            (Some(false), None | Some(Value::Bool(false))) => ApprovalDecision::Deny,
+            (Some(true), None | Some(Value::Bool(false))) => ApprovalDecision::Once,
+            (Some(true), Some(Value::Bool(true))) => ApprovalDecision::Session,
+            _ => return fail("invalid approval decision"),
+        };
         let turn = self.turn_id.clone();
         let pending = self
             .pending
@@ -289,8 +361,43 @@ impl Session {
             .sender
             .take()
             .ok_or_else(|| ToolError("approval already resolved".into()))?;
-        let _ = sender.send(allow);
+        let _ = sender.send(decision);
         Ok(())
+    }
+
+    pub(crate) fn configure_mode(&mut self, mode: ApprovalMode, confirmed: bool) -> Result<()> {
+        if mode == ApprovalMode::FullSend && !confirmed {
+            return fail("full send requires confirmation");
+        }
+        if self.approval_mode != mode {
+            self.approval_mode = mode;
+            self.allowed_tools.clear();
+            self.screenshot_granted = false;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_screenshots(&mut self, access: Access) {
+        if self.screenshots != access {
+            self.screenshots = access;
+            self.screenshot_granted = false;
+            self.allowed_tools.remove("builtin:screenshot");
+        }
+    }
+
+    fn needs_approval(&self, name: &str, arguments: &Value, grant: &str) -> bool {
+        if self.approval_mode == ApprovalMode::FullSend
+            || matches!(name, "files_list" | "file_read")
+            || (name == "screenshot" && self.screenshot_granted)
+            || self.allowed_tools.contains(grant)
+        {
+            return false;
+        }
+        !(name == "file_write"
+            && self.approval_mode == ApprovalMode::WorkspaceEdits
+            && arguments["path"]
+                .as_str()
+                .is_some_and(|path| self.workspace.contains_write_path(path)))
     }
 
     pub fn cancel(&self) {
@@ -314,7 +421,13 @@ impl Drop for ApprovalGuard {
     }
 }
 
-pub async fn approval(session: &Shared, call_id: &str, name: &str, arguments: &Value) -> bool {
+async fn approval(
+    session: &Shared,
+    call_id: &str,
+    name: &str,
+    arguments: &Value,
+    grant: &str,
+) -> bool {
     let (sender, receiver) = oneshot::channel();
     let request_id = token();
     {
@@ -337,24 +450,30 @@ pub async fn approval(session: &Shared, call_id: &str, name: &str, arguments: &V
         session: session.clone(),
         request_id,
     };
-    matches!(
-        tokio::time::timeout(Duration::from_secs(90), receiver).await,
-        Ok(Ok(true))
-    )
+    match tokio::time::timeout(Duration::from_secs(90), receiver).await {
+        Ok(Ok(ApprovalDecision::Session)) => {
+            session.borrow_mut().allowed_tools.insert(grant.to_owned());
+            true
+        }
+        Ok(Ok(ApprovalDecision::Once)) => true,
+        _ => false,
+    }
 }
 
-pub async fn invoke(
+async fn invoke(
     session: &Shared,
     call_id: &str,
     name: &str,
     arguments: Value,
     mcp: Option<&Mcp>,
+    image: &mut Option<Value>,
 ) -> Result<Value> {
     let arguments = match arguments {
         Value::Object(map) if Value::Object(map.clone()).to_string().len() <= 128 * 1024 => map,
         _ => return fail("tool arguments exceed limit"),
     };
-    let schemas = tools_schema();
+    let screenshots = session.borrow().screenshots;
+    let schemas = tools_schema(screenshots);
     let builtin = schemas
         .iter()
         .find(|t| t["function"]["name"] == name)
@@ -374,24 +493,22 @@ pub async fn invoke(
         None if mcp.is_some_and(|m| m.has(name)) => {}
         None => return fail("unknown tool"),
     }
-    let policy = session.borrow().policy.clone();
+    let grant = match builtin {
+        Some(_) => format!("builtin:{name}"),
+        None => mcp.unwrap().approval_identity(name),
+    };
+    let arguments_value = Value::Object(arguments.clone());
+    let needs_approval = session
+        .borrow()
+        .needs_approval(name, &arguments_value, &grant);
     let flag = |k: &str| arguments.get(k).and_then(Value::as_bool).unwrap_or(false);
-    // External MCP calls always need harness consent; Center may require more.
-    let needs_approval = builtin.is_none()
-        || (name == "file_write" && policy["writes"] != true)
-        || (name == "command"
-            && (policy["commands"] != true
-                || (flag("writable") && policy["writes"] != true)
-                || (flag("network") && policy["network"] != true)));
     session.borrow_mut().emit(
         "tool.started",
         json!({"call_id": call_id, "tool": name, "arguments": Value::Object(arguments.clone())}),
     );
     let started = Instant::now();
     let outcome = async {
-        if needs_approval
-            && !approval(session, call_id, name, &Value::Object(arguments.clone())).await
-        {
+        if needs_approval && !approval(session, call_id, name, &arguments_value, &grant).await {
             return fail("tool action declined or approval expired");
         }
         let text = |k: &str| {
@@ -435,6 +552,17 @@ pub async fn invoke(
                     &text("text")?,
                     expected.as_deref(),
                 )
+            }
+            "screenshot" => {
+                if image.is_some() {
+                    return fail("one screenshot per model step");
+                }
+                let capture = screenshot::capture(screenshots, &text("target")?).await?;
+                session.borrow_mut().screenshot_granted = true;
+                if let Some(url) = capture.image_url {
+                    *image = Some(screenshot::message(call_id, url));
+                }
+                Ok(json!({"description": capture.description, "image_attached": image.is_some()}))
             }
             "command" => {
                 let argv = arguments["argv"]
@@ -549,13 +677,20 @@ pub(crate) async fn run_configured(
     if instructions.is_some_and(|i| i.len() > 131072) {
         return fail("skill instruction context exceeds limit");
     }
-    let provider = session.borrow().provider.clone();
-    let mut tools = tools_schema();
+    let (provider, screenshots) = {
+        let s = session.borrow();
+        (s.provider.clone(), s.screenshots)
+    };
+    let known_local = Profile::is_builtin(&provider, model);
+    let mut tools = tools_schema(if known_local && model != Profile::VISION_MODEL {
+        Access::Off
+    } else {
+        screenshots
+    });
     if let Some(mcp) = mcp {
         tools.extend(mcp.schemas.borrow().iter().cloned());
     }
     let full_tools = tools;
-    let known_local = Profile::is_builtin(&provider, model);
     {
         let mut s = session.borrow_mut();
         let mut messages = s.messages.clone();
@@ -577,7 +712,8 @@ pub(crate) async fn run_configured(
     let mut incomplete = false;
     let steps = async {
         let mut task = task;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
+        let mut image: Option<Value> = None;
         for _ in 0..max_steps {
             let mut messages = {
                 let mut s = session.borrow_mut();
@@ -619,6 +755,10 @@ pub(crate) async fn run_configured(
             }
             if let Some(instructions) = instructions.filter(|i| !i.is_empty()) {
                 messages.insert(0, json!({"role": "system", "content": instructions}));
+            }
+            // Screenshot bytes belong only to the next provider request.
+            if let Some(visual) = image.take() {
+                messages.push(visual);
             }
             // Streamed text reaches the client as it arrives; reasoning is
             // closed by the first answer text or by the end of the reply.
@@ -720,7 +860,15 @@ pub(crate) async fn run_configured(
                         {
                             arguments.entry("expected_sha256").or_insert(Value::Null);
                         }
-                        invoke(session, &call_id, name, Value::Object(arguments), mcp).await
+                        invoke(
+                            session,
+                            &call_id,
+                            name,
+                            Value::Object(arguments),
+                            mcp,
+                            &mut image,
+                        )
+                        .await
                     }
                     _ => {
                         incomplete = true;
@@ -802,7 +950,8 @@ mod transcript_tests {
                 Workspace::new(dir.path(), &[]).unwrap(),
                 "local",
                 "minicpm5-1b",
-                json!({"writes": true, "commands": false, "network": false}),
+                ApprovalMode::WorkspaceEdits,
+                Access::Off,
                 "default",
             )
             .unwrap(),
