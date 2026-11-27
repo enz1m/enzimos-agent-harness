@@ -459,8 +459,17 @@ impl Mcp {
                 continue;
             }
             let parameters = routing::parameters(app_id, id, &route.function["input_schema"]);
+            let description = match alias.as_str() {
+                "task_manager_list" => json!(
+                    "Read Task Manager's sampled processes. If asked to open Task Manager, call open_app first and wait for success. For the highest CPU process use sort cpu_desc and limit 1."
+                ),
+                "browser_read" => json!(
+                    "Read the tab returned by browser_open. Pass its page_id. The default snapshot is sufficient for the page title or heading."
+                ),
+                _ => route.function["description"].clone(),
+            };
             let schema = json!({"type":"function","function":{
-                "name":alias,"description":route.function["description"],"parameters":parameters
+                "name":alias,"description":description,"parameters":parameters
             }});
             let len = schema.to_string().len();
             if bytes + len > 4800 {
@@ -883,6 +892,9 @@ impl Mcp {
             {
                 arguments["workspace"] = workspace.clone();
             }
+        }
+        if (route.app.as_str(), route.id.as_str()) == ("io.github.enzui.Calendar", "create_event") {
+            routing::calendar_arguments(&mut arguments)?;
         }
         let result = call_center(&client, &route, arguments, call_id, &stale).await;
         if result

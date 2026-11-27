@@ -397,6 +397,21 @@ pub(crate) fn builtin_relevant(name: &str, prompt: &str) -> bool {
 
 pub(super) fn parameters(app: &str, id: &str, schema: &Value) -> Value {
     let mut schema = schema.clone();
+    if (app, id) == ("io.github.enzui.Calendar", "create_event")
+        && let Some(properties) = schema["properties"].as_object_mut()
+        && properties.remove("start_minute").is_some()
+    {
+        properties.insert(
+            "start_time".into(),
+            json!({
+                "type":"string", "pattern":"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$",
+                "description":"Local start in 24-hour HH:MM format, e.g. 14:30."
+            }),
+        );
+        properties["duration_minutes"]["description"] =
+            json!("Omit unless the user supplies a duration. Defaults to 30 minutes.");
+        schema["required"] = json!(["title", "date", "start_time"]);
+    }
     if app == "io.github.enzui.Files"
         && id == "current_folder"
         && let Some(properties) = schema["properties"].as_object_mut()
@@ -410,12 +425,52 @@ pub(super) fn parameters(app: &str, id: &str, schema: &Value) -> Value {
     schema["properties"]["folder"]["description"] = json!(
         "For Files, provide the folder requested by the user, e.g. Downloads, Documents, Home, or an absolute path."
     );
+    schema["properties"]["app"]["description"] = json!(
+        "The application name, e.g. Files or Task Manager. Put Downloads in folder, not app."
+    );
     schema
+}
+
+pub(super) fn calendar_arguments(arguments: &mut Value) -> crate::Result<()> {
+    let fields = arguments
+        .as_object_mut()
+        .ok_or_else(|| crate::ToolError("Expected Calendar arguments.".into()))?;
+    if let Some(time) = fields.remove("start_time") {
+        let minute = time
+            .as_str()
+            .filter(|time| time.len() == 5)
+            .and_then(|time| time.split_once(':'))
+            .filter(|(hour, minute)| {
+                [*hour, *minute]
+                    .iter()
+                    .all(|part| part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_digit()))
+            })
+            .and_then(|(hour, minute)| {
+                Some((hour.parse::<u32>().ok()?, minute.parse::<u32>().ok()?))
+            })
+            .filter(|(hour, minute)| *hour < 24 && *minute < 60)
+            .map(|(hour, minute)| hour * 60 + minute);
+        let Some(minute) = minute.filter(|_| !fields.contains_key("start_minute")) else {
+            return crate::fail("Provide one start time in 24-hour HH:MM format.");
+        };
+        fields.insert("start_minute".into(), json!(minute));
+    }
+    fields.entry("duration_minutes").or_insert(json!(30));
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_time_is_converted_before_consent() {
+        let mut arguments = json!({"start_time":"14:30"});
+        calendar_arguments(&mut arguments).expect("valid time");
+        assert_eq!(arguments, json!({"start_minute":870,"duration_minutes":30}));
+        assert!(calendar_arguments(&mut json!({"start_time":"24:00"})).is_err());
+        assert!(calendar_arguments(&mut json!({"start_time":"14:30","start_minute":14})).is_err());
+    }
 
     #[test]
     fn browser_short_name_ranks_native_open_and_read() {
