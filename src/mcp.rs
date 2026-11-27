@@ -65,12 +65,19 @@ impl StdioClient {
             Value::Object(map) => map
                 .iter()
                 .map(|(k, v)| {
-                    if !["HOME", "XDG_RUNTIME_DIR", "PATH", "LANG"].contains(&k.as_str()) {
+                    if k.is_empty()
+                        || k.len() > 128
+                        || k.starts_with("LD_")
+                        || !k.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                    {
                         return fail("MCP environment requires an explicit supported key");
                     }
-                    let value = v.as_str().ok_or_else(|| {
-                        ToolError("MCP environment values must be strings".into())
-                    })?;
+                    let value = v
+                        .as_str()
+                        .filter(|value| value.len() <= 4096 && !value.contains('\0'))
+                        .ok_or_else(|| {
+                            ToolError("MCP environment values must be strings".into())
+                        })?;
                     Ok((k.clone(), value.to_owned()))
                 })
                 .collect::<Result<_>>()?,
@@ -255,11 +262,11 @@ pub struct Mcp {
     routes: RefCell<BTreeMap<String, (Rc<Client>, String)>>,
     pub schemas: RefCell<Vec<Value>>,
     center: RefCell<Option<Rc<StdioClient>>>,
-    center_routes: RefCell<BTreeMap<String, &'static str>>,
+    center_routes: RefCell<BTreeMap<String, (&'static str, &'static str)>>,
     approval_identities: RefCell<BTreeMap<String, String>>,
 }
 
-fn server_name(name: &str) -> bool {
+pub(crate) fn server_name(name: &str) -> bool {
     let b = name.as_bytes();
     (1..=24).contains(&b.len())
         && b[0].is_ascii_lowercase()
@@ -298,7 +305,7 @@ impl Mcp {
         self.center_routes.borrow().contains_key(alias)
     }
 
-    pub(crate) async fn start_center(&self) -> Result<()> {
+    pub(crate) async fn start_center(&self, browser: bool) -> Result<()> {
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .map(std::path::PathBuf::from)
             .filter(|path| path.is_absolute())
@@ -327,27 +334,43 @@ impl Mcp {
         let mut schemas = Vec::new();
         let mut routes = BTreeMap::new();
         // Inspection is independent of the prompt and preserves the order of the model prefix.
-        for (alias, id) in CENTER_TOOLS {
-            let reply = client
-                .request(
-                    "tools/call",
-                    json!({
-                        "name":"enzui_function",
-                        "arguments":{"app_id":SETTINGS_APP, "function_id":id}
-                    }),
-                )
-                .await?;
-            let function = &center_result(&reply)?["function"];
-            if function["id"] != *id || function["input_schema"]["type"] != "object" {
-                return fail(CENTER_UNAVAILABLE);
+        let apps = [(SETTINGS_APP, CENTER_TOOLS), (BROWSER_APP, BROWSER_TOOLS)];
+        for (app, tools) in apps {
+            if app == BROWSER_APP && !browser {
+                continue;
             }
-            if self.has(alias) {
-                return fail("duplicate MCP tool alias");
+            for (alias, id, description) in tools {
+                let reply = client
+                    .request(
+                        "tools/call",
+                        json!({
+                            "name":"enzui_function",
+                            "arguments":{"app_id":app, "function_id":id}
+                        }),
+                    )
+                    .await;
+                let result = reply.and_then(|reply| center_result(&reply));
+                let Ok(result) = result else {
+                    if app == SETTINGS_APP {
+                        return fail(CENTER_UNAVAILABLE);
+                    }
+                    break;
+                };
+                let function = &result["function"];
+                if function["id"] != *id || function["input_schema"]["type"] != "object" {
+                    if app == SETTINGS_APP {
+                        return fail(CENTER_UNAVAILABLE);
+                    }
+                    break;
+                }
+                if self.has(alias) {
+                    return fail("duplicate MCP tool alias");
+                }
+                schemas.push(json!({"type":"function","function":{
+                    "name":alias,"description":description,"parameters":function["input_schema"]
+                }}));
+                routes.insert((*alias).to_owned(), (app, *id));
             }
-            schemas.push(json!({"type":"function","function":{
-                "name":alias,"description":function["description"],"parameters":function["input_schema"]
-            }}));
-            routes.insert((*alias).to_owned(), *id);
         }
         self.schemas.borrow_mut().extend(schemas);
         self.center_routes.replace(routes);
@@ -375,143 +398,178 @@ impl Mcp {
             if config.get("enabled") != Some(&json!(true)) {
                 continue;
             }
-            let client = Rc::new(
-                match config
-                    .get("transport")
-                    .and_then(Value::as_str)
-                    .unwrap_or("stdio")
-                {
-                    "stdio" => {
-                        let c = StdioClient::new(
-                            &config["argv"],
-                            config.get("environment").unwrap_or(&Value::Null),
-                        )?;
-                        self.clients
-                            .borrow_mut()
-                            .push(Rc::new(Client::Stdio(c.clone())));
-                        c.start().await?;
-                        Client::Stdio(c)
+            if config["managed"] == true {
+                let (clients, schemas) = (self.clients.borrow().len(), self.schemas.borrow().len());
+                let existing = self.routes.borrow().keys().cloned().collect::<HashSet<_>>();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(8),
+                    self.discover_server(&name, &config),
+                )
+                .await;
+                if !result.is_ok_and(|result| result.is_ok()) {
+                    self.schemas.borrow_mut().truncate(schemas);
+                    self.routes
+                        .borrow_mut()
+                        .retain(|alias, _| existing.contains(alias));
+                    self.approval_identities
+                        .borrow_mut()
+                        .retain(|alias, _| existing.contains(alias));
+                    let failed = self.clients.borrow_mut().split_off(clients);
+                    for client in failed {
+                        client.close().await;
                     }
-                    "http" => {
-                        let c = HttpClient::new(
-                            config["url"].as_str().unwrap_or_default(),
-                            config.get("authorization").and_then(Value::as_str),
-                        )?;
-                        self.clients
-                            .borrow_mut()
-                            .push(Rc::new(Client::Http(c.clone())));
-                        c.start().await?;
-                        Client::Http(c)
-                    }
-                    _ => return fail("unsupported MCP transport"),
-                },
-            );
-            // Explicit selection keeps large catalogs out of the model context.
-            let selected = match config.get("selected_tools") {
-                None | Some(Value::Null) => None,
-                Some(Value::Array(list)) if list.len() <= 32 => {
-                    let names = list
-                        .iter()
-                        .map(|v| v.as_str().map(str::to_owned))
-                        .collect::<Option<Vec<_>>>()
-                        .ok_or_else(|| ToolError("invalid MCP tool selection".into()))?;
-                    if names.iter().collect::<HashSet<_>>().len() != names.len() {
-                        return fail("invalid MCP tool selection");
-                    }
-                    Some(names)
                 }
-                _ => return fail("invalid MCP tool selection"),
-            };
-            let mut tools = Vec::new();
-            let mut cursors = HashSet::new();
-            let mut cursor: Option<String> = None;
-            let mut catalog_bytes = 0;
-            let mut complete = false;
-            for _ in 0..8 {
-                let result = client
-                    .request(
-                        "tools/list",
-                        cursor.as_ref().map_or(json!({}), |c| json!({"cursor": c})),
-                    )
-                    .await?;
-                let rows = result["tools"]
-                    .as_array()
-                    .ok_or_else(|| ToolError("invalid MCP tool catalog".into()))?;
-                catalog_bytes += json!(rows).to_string().len();
-                tools.extend(rows.iter().cloned());
-                if tools.len() > 256 || catalog_bytes > 2 * MAX_FRAME {
-                    return fail("MCP catalog exceeds discovery limit");
+            } else {
+                self.discover_server(&name, &config).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn discover_server(&self, name: &str, config: &Value) -> Result<()> {
+        let client = Rc::new(
+            match config
+                .get("transport")
+                .and_then(Value::as_str)
+                .unwrap_or("stdio")
+            {
+                "stdio" => {
+                    let c = StdioClient::new(
+                        &config["argv"],
+                        config.get("environment").unwrap_or(&Value::Null),
+                    )?;
+                    self.clients
+                        .borrow_mut()
+                        .push(Rc::new(Client::Stdio(Rc::clone(&c))));
+                    c.start().await?;
+                    Client::Stdio(c)
                 }
-                match result.get("nextCursor") {
-                    None | Some(Value::Null) => {
-                        complete = true;
-                        break;
-                    }
-                    Some(Value::String(c)) if c.is_empty() => {
-                        complete = true;
-                        break;
-                    }
-                    Some(Value::String(c)) if c.len() <= 4096 && cursors.insert(c.clone()) => {
-                        cursor = Some(c.clone())
-                    }
-                    _ => return fail("invalid MCP pagination cursor"),
+                "http" => {
+                    let c = HttpClient::with_headers(
+                        config["url"].as_str().unwrap_or_default(),
+                        config.get("authorization").and_then(Value::as_str),
+                        &config["headers"],
+                    )?;
+                    self.clients
+                        .borrow_mut()
+                        .push(Rc::new(Client::Http(Rc::clone(&c))));
+                    c.start().await?;
+                    Client::Http(c)
                 }
-            }
-            if !complete {
-                return fail("MCP catalog page budget exceeded");
-            }
-            let names = tools
-                .iter()
-                .map(|t| t["name"].as_str().map(str::to_owned))
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| ToolError("invalid duplicate MCP catalog names".into()))?;
-            if names.iter().collect::<HashSet<_>>().len() != names.len() {
-                return fail("invalid duplicate MCP catalog names");
-            }
-            if let Some(selected) = &selected {
-                if !selected.iter().all(|s| names.contains(s)) {
-                    return fail("selected MCP tool unavailable");
+                _ => return fail("unsupported MCP transport"),
+            },
+        );
+        // Explicit selection keeps large catalogs out of the model context.
+        let selected = match config.get("selected_tools") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(list)) if list.len() <= 32 => {
+                let names = list
+                    .iter()
+                    .map(|v| v.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| ToolError("invalid MCP tool selection".into()))?;
+                if names.iter().collect::<HashSet<_>>().len() != names.len() {
+                    return fail("invalid MCP tool selection");
                 }
-                tools.retain(|t| selected.iter().any(|s| t["name"] == s.as_str()));
+                Some(names)
             }
-            if tools.len() > 32 {
-                return fail("select at most32 tools from this MCP server");
+            _ => return fail("invalid MCP tool selection"),
+        };
+        let mut tools = Vec::new();
+        let mut cursors = HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut catalog_bytes = 0;
+        let mut complete = false;
+        for _ in 0..8 {
+            let result = client
+                .request(
+                    "tools/list",
+                    cursor
+                        .as_ref()
+                        .map_or_else(|| json!({}), |c| json!({"cursor": c})),
+                )
+                .await?;
+            let rows = result["tools"]
+                .as_array()
+                .ok_or_else(|| ToolError("invalid MCP tool catalog".into()))?;
+            catalog_bytes += json!(rows).to_string().len();
+            tools.extend(rows.iter().cloned());
+            if tools.len() > 256 || catalog_bytes > 2 * MAX_FRAME {
+                return fail("MCP catalog exceeds discovery limit");
             }
-            for tool in tools {
-                let original = tool["name"].as_str().unwrap_or_default().to_owned();
-                if !tool_name(&original) {
-                    return fail("unsupported MCP tool name");
+            match result.get("nextCursor") {
+                None | Some(Value::Null) => {
+                    complete = true;
+                    break;
                 }
-                let mut alias = format!("mcp_{name}_{original}");
-                if alias.len() > 64 {
-                    alias = format!("{}_{}", &alias[..53], &sha256_hex(alias.as_bytes())[..10]);
+                Some(Value::String(c)) if c.is_empty() => {
+                    complete = true;
+                    break;
                 }
-                if self.routes.borrow().contains_key(&alias) {
-                    return fail("duplicate MCP tool alias");
+                Some(Value::String(c)) if c.len() <= 4096 && cursors.insert(c.clone()) => {
+                    cursor = Some(c.clone());
                 }
-                let schema = tool
-                    .get("inputSchema")
-                    .filter(|s| s["type"] == "object")
-                    .cloned()
-                    .ok_or_else(|| ToolError("invalid MCP schema".into()))?;
-                let description = tool
-                    .get("description")
-                    .map(|d| d.as_str().map_or_else(|| d.to_string(), str::to_owned))
-                    .unwrap_or_default();
-                let description = description.chars().take(1024).collect::<String>();
-                let identity =
-                    crate::runtime::fingerprint(&json!([name, original, schema, description]));
-                self.approval_identities
-                    .borrow_mut()
-                    .insert(alias.clone(), format!("mcp:{identity}"));
-                self.routes
-                    .borrow_mut()
-                    .insert(alias.clone(), (client.clone(), original));
-                self.schemas.borrow_mut().push(json!({"type": "function", "function": {"name": alias, "description": description, "parameters": schema}}));
+                _ => return fail("invalid MCP pagination cursor"),
             }
-            if json!(*self.schemas.borrow()).to_string().len() > 65536 {
-                return fail("MCP discovery context exceeds limit");
+        }
+        if !complete {
+            return fail("MCP catalog page budget exceeded");
+        }
+        let names = tools
+            .iter()
+            .map(|t| t["name"].as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| ToolError("invalid duplicate MCP catalog names".into()))?;
+        if names.iter().collect::<HashSet<_>>().len() != names.len() {
+            return fail("invalid duplicate MCP catalog names");
+        }
+        if let Some(selected) = &selected {
+            if !selected.iter().all(|s| names.contains(s)) {
+                return fail("selected MCP tool unavailable");
             }
+            tools.retain(|t| selected.iter().any(|s| t["name"] == s.as_str()));
+        }
+        if tools.len() > 32 {
+            return fail("select at most32 tools from this MCP server");
+        }
+        for tool in tools {
+            let original = tool["name"].as_str().unwrap_or_default().to_owned();
+            if !tool_name(&original) {
+                return fail("unsupported MCP tool name");
+            }
+            let mut alias = format!("mcp_{name}_{original}");
+            if alias.len() > 64 {
+                alias = format!(
+                    "{}_{}",
+                    alias.get(..53).unwrap_or_default(),
+                    sha256_hex(alias.as_bytes()).get(..10).unwrap_or_default()
+                );
+            }
+            if self.routes.borrow().contains_key(&alias) {
+                return fail("duplicate MCP tool alias");
+            }
+            let schema = tool
+                .get("inputSchema")
+                .filter(|s| s["type"] == "object")
+                .cloned()
+                .ok_or_else(|| ToolError("invalid MCP schema".into()))?;
+            let description = tool
+                .get("description")
+                .map(|d| d.as_str().map_or_else(|| d.to_string(), str::to_owned))
+                .unwrap_or_default();
+            let description = description.chars().take(1024).collect::<String>();
+            let identity =
+                crate::runtime::fingerprint(&json!([name, original, schema, description]));
+            self.approval_identities
+                .borrow_mut()
+                .insert(alias.clone(), format!("mcp:{identity}"));
+            self.routes
+                .borrow_mut()
+                .insert(alias.clone(), (Rc::clone(&client), original));
+            self.schemas.borrow_mut().push(json!({"type": "function", "function": {"name": alias, "description": description, "parameters": schema}}));
+        }
+        if json!(*self.schemas.borrow()).to_string().len() > 65536 {
+            return fail("MCP discovery context exceeds limit");
         }
         Ok(())
     }
@@ -522,13 +580,13 @@ impl Mcp {
     /// Returns an error for an unknown tool, a refused call or transport failure.
     pub async fn call(&self, alias: &str, arguments: Value) -> Result<Value> {
         let center_route = self.center_routes.borrow().get(alias).copied();
-        if let Some(id) = center_route {
+        if let Some((app, id)) = center_route {
             let client = self
                 .center
                 .borrow()
                 .clone()
                 .ok_or_else(|| ToolError(CENTER_UNAVAILABLE.into()))?;
-            return call_center(&client, id, arguments).await;
+            return call_center(&client, app, id, arguments).await;
         }
         let route = self.routes.borrow().get(alias).cloned();
         let (client, name) = route.ok_or_else(|| ToolError("unknown MCP tool".into()))?;
@@ -555,14 +613,55 @@ impl Mcp {
 
 const SETTINGS_APP: &str = "dev.enzui.Settings";
 pub(crate) const CENTER_UNAVAILABLE: &str = "The desktop MCP Center is unavailable.";
-const CENTER_TOOLS: &[(&str, &str)] = &[
-    ("search_settings", "settings.search"),
-    ("get_setting", "settings.read"),
-    ("set_setting", "settings.change"),
-    ("open_app", "desktop.open"),
-    ("start_timer", "desktop.timer"),
-    ("device_status", "desktop.status"),
-    ("find_downloads", "desktop.downloads"),
+const BROWSER_APP: &str = "org.enzim.Browser";
+const CENTER_TOOLS: &[(&str, &str, &str)] = &[
+    (
+        "search_settings",
+        "settings.search",
+        "Find a setting's id, current value and allowed values by short query.",
+    ),
+    (
+        "get_setting",
+        "settings.read",
+        "Read a setting by id if search omitted its value.",
+    ),
+    (
+        "set_setting",
+        "settings.change",
+        "Set a value using the id and allowed values from search_settings.",
+    ),
+    (
+        "open_app",
+        "desktop.open",
+        "Open an installed app, or use Files and folder to open a folder.",
+    ),
+    (
+        "start_timer",
+        "desktop.timer",
+        "Start a timer that shows a desktop notification.",
+    ),
+    (
+        "device_status",
+        "desktop.status",
+        "Read live battery, CPU, memory or network status.",
+    ),
+    (
+        "find_downloads",
+        "desktop.downloads",
+        "Find download filenames modified today, yesterday, or on a YYYY-MM-DD date.",
+    ),
+];
+const BROWSER_TOOLS: &[(&str, &str, &str)] = &[
+    (
+        "browser_open",
+        "new_page",
+        "Open a URL in Browser. Returns a page ID.",
+    ),
+    (
+        "browser_read",
+        "take_snapshot",
+        "Read text and headings from a Browser page ID.",
+    ),
 ];
 
 fn center_result(reply: &Value) -> Result<Value> {
@@ -594,9 +693,9 @@ fn center_result(reply: &Value) -> Result<Value> {
         .ok_or_else(|| ToolError(CENTER_UNAVAILABLE.into()))
 }
 
-async fn call_center(client: &StdioClient, id: &str, arguments: Value) -> Result<Value> {
+async fn call_center(client: &StdioClient, app: &str, id: &str, arguments: Value) -> Result<Value> {
     let request = json!({"name":"enzui_call","arguments":{
-        "app_id":SETTINGS_APP, "function_id":id, "arguments":arguments,
+        "app_id":app, "function_id":id, "arguments":arguments,
     }});
     // Matches the MCP Center's longest call so the user has time to read the consent dialog.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);

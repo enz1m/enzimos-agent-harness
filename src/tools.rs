@@ -4,12 +4,12 @@
 use crate::{Result, ToolError, fail, sha256_hex};
 use serde_json::{Value, json};
 use std::{
-    ffi::CString,
+    ffi::{CString, OsStr},
     fs::File,
     io::{Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::fs::MetadataExt,
+        unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Path, PathBuf},
     process::Stdio,
@@ -20,9 +20,9 @@ use tokio::io::AsyncReadExt;
 pub const MAX_BYTES: usize = 256 * 1024;
 
 #[allow(unsafe_code, reason = "Linux syscall ABI (openat).")]
-fn openat(dir: i32, name: &str, flags: i32, mode: u32) -> std::io::Result<OwnedFd> {
-    let name =
-        CString::new(name).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+fn openat(dir: i32, name: impl AsRef<OsStr>, flags: i32, mode: u32) -> std::io::Result<OwnedFd> {
+    let name = CString::new(name.as_ref().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC, mode) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
@@ -185,7 +185,7 @@ impl Workspace {
         }
         let fd = openat(
             libc::AT_FDCWD,
-            &path.to_string_lossy(),
+            &path,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
             0,
         )
@@ -476,6 +476,52 @@ impl Workspace {
     }
 }
 
+pub(crate) fn sweep_scratch(workspace: &Workspace) {
+    fn visit(fd: &impl AsRawFd, device: u64, depth: usize) {
+        let root = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if metadata.dev() != device {
+                continue;
+            }
+            let stale = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.elapsed().ok())
+                .is_some_and(|age| age >= Duration::from_secs(24 * 60 * 60));
+            if metadata.is_dir() {
+                // Descend through an open directory descriptor, even if its name is replaced.
+                if depth < 32
+                    && let Ok(child) = openat(
+                        fd.as_raw_fd(),
+                        entry.file_name(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                        0,
+                    )
+                {
+                    let child = File::from(child);
+                    if child.metadata().is_ok_and(|m| m.dev() == device) {
+                        visit(&child, device, depth + 1);
+                    }
+                }
+                if stale {
+                    let _ = std::fs::remove_dir(entry.path());
+                }
+            } else if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    if workspace.unchanged().is_ok() {
+        visit(&workspace.fd, workspace.identity.0, 0);
+    }
+}
+
 async fn drain<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     total: &std::cell::Cell<usize>,
@@ -710,6 +756,32 @@ pub(crate) mod tests {
 
     pub(crate) fn workspace_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn scratch_expiry_does_not_follow_symlinks() {
+        use std::{fs, fs::FileTimes, time::SystemTime};
+        let parent = tempfile::tempdir().expect("fixture");
+        let scratch = parent.path().join("scratch");
+        fs::create_dir(&scratch).expect("scratch directory");
+        let outside = parent.path().join("outside");
+        fs::create_dir(&outside).expect("outside directory");
+        for file in [scratch.join("old.txt"), outside.join("old.txt")] {
+            let f = File::create(file).expect("draft");
+            let old = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+            f.set_times(FileTimes::new().set_modified(old))
+                .expect("age fixture");
+        }
+        fs::write(scratch.join("recent.txt"), "draft").expect("recent draft");
+        std::os::unix::fs::symlink(&outside, scratch.join("link")).expect("escape link");
+        let workspace = Workspace::new(&scratch, &[]).expect("scratch workspace");
+        sweep_scratch(&workspace);
+        assert!(!scratch.join("old.txt").exists(), "stale draft expired");
+        assert!(
+            scratch.join("recent.txt").is_file(),
+            "recent draft retained"
+        );
+        assert!(outside.join("old.txt").is_file(), "symlink target retained");
     }
 
     #[test]

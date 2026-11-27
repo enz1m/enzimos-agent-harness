@@ -113,6 +113,13 @@ fn open_arguments(prompt: &str) -> Option<Value> {
 }
 
 impl Task {
+    pub(crate) fn uses_browser(prompt: &str) -> bool {
+        let lower = prompt.to_lowercase();
+        ["browser", "web page", "website", "https://", "http://"]
+            .iter()
+            .any(|keyword| lower.contains(keyword))
+    }
+
     pub(crate) fn asks_for_screenshot(prompt: &str) -> bool {
         let instruction = prompt
             .split([':', '\n'])
@@ -196,6 +203,22 @@ impl Task {
     }
 
     fn classify_with_device(prompt: &str, follows_tools: bool, legacy_device: bool) -> Self {
+        let lower = prompt.to_lowercase();
+        if [
+            "scratch",
+            "mcp server",
+            "skill folder",
+            "add a skill",
+            "add this skill",
+            "install a skill",
+            "install this skill",
+        ]
+        .iter()
+        .any(|keyword| lower.contains(keyword))
+            || Self::uses_browser(prompt)
+        {
+            return Self::Full;
+        }
         if Self::asks_for_screenshot(prompt) {
             return Self::Screen;
         }
@@ -354,7 +377,11 @@ impl Profile {
                 if !desktop_available {
                     instructions.push_str(PROFILES["chat_only"].as_str()?);
                 }
-                Vec::new()
+                full_tools
+                    .iter()
+                    .filter(|tool| tool["function"]["name"] == "local_time")
+                    .cloned()
+                    .collect()
             }
             Task::Device(_) => {
                 instructions.push_str("\nUse the desktop tool for the request. Answer from its result in the user's language.");

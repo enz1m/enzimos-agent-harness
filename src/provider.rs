@@ -341,11 +341,14 @@ impl Gateway {
             .map_err(|_| ToolError(PROVIDER_TIMEOUT.into()))?
     }
 
-    pub(crate) async fn warmup(&self, model: Option<&str>) -> Result<Value> {
+    pub(crate) async fn warmup(&self, model: Option<&str>, prefix: Option<Value>) -> Result<Value> {
         let (reader, mut writer) = self.connect().await?.into_split();
         let mut body = json!({"provider": "local"});
         if let Some(model) = model {
             body["model"] = json!(model);
+        }
+        if let Some(prefix) = prefix {
+            body["prefix"] = prefix;
         }
         let body = body.to_string();
         let request = format!(

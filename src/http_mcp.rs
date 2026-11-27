@@ -20,7 +20,7 @@ pub struct HttpClient {
     host: String,
     port: u16,
     target: String,
-    authorization: Option<String>,
+    headers: Vec<(String, String)>,
     session: RefCell<Option<String>>,
     protocol: RefCell<Option<String>>,
     request_id: Cell<u64>,
@@ -33,7 +33,19 @@ fn printable(value: &str, low: u8) -> bool {
 }
 
 impl HttpClient {
+    /// Configure an explicit HTTP MCP endpoint with optional authorization.
+    ///
+    /// # Errors
+    /// Rejects invalid endpoints and unsafe authorization header values.
     pub fn new(url: &str, authorization: Option<&str>) -> Result<Rc<Self>> {
+        Self::with_headers(url, authorization, &Value::Null)
+    }
+
+    pub(crate) fn with_headers(
+        url: &str,
+        authorization: Option<&str>,
+        custom: &Value,
+    ) -> Result<Rc<Self>> {
         if url.len() > 4096 {
             return fail("invalid MCP endpoint");
         }
@@ -83,6 +95,46 @@ impl HttpClient {
         {
             return fail("invalid explicit MCP authorization");
         }
+        let mut headers = authorization
+            .into_iter()
+            .map(|value| ("Authorization".to_owned(), value.to_owned()))
+            .collect::<Vec<_>>();
+        if !custom.is_null() {
+            let custom = custom
+                .as_object()
+                .filter(|headers| headers.len() <= 24)
+                .ok_or_else(|| ToolError("invalid MCP request headers".into()))?;
+            for (key, value) in custom {
+                let key = key.to_ascii_lowercase();
+                let value = value
+                    .as_str()
+                    .filter(|value| value.len() <= 4096 && printable(value, 32))
+                    .ok_or_else(|| ToolError("invalid MCP request header value".into()))?;
+                if reqwest::header::HeaderName::from_bytes(key.as_bytes()).is_err()
+                    || [
+                        "host",
+                        "connection",
+                        "accept",
+                        "content-length",
+                        "content-type",
+                        "transfer-encoding",
+                        "upgrade",
+                        "expect",
+                        "te",
+                        "trailer",
+                    ]
+                    .contains(&key.as_str())
+                    || key.starts_with("mcp-")
+                    || key.starts_with("proxy-")
+                    || headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case(&key))
+                {
+                    return fail("invalid MCP request header name");
+                }
+                headers.push((key, value.to_owned()));
+            }
+        }
         let tls = scheme == "https";
         let target = if target.is_empty() {
             "/".to_owned()
@@ -97,7 +149,7 @@ impl HttpClient {
             port: port.unwrap_or(if tls { 443 } else { 80 }),
             host,
             target,
-            authorization: authorization.map(str::to_owned),
+            headers,
             session: RefCell::new(None),
             protocol: RefCell::new(None),
             request_id: Cell::new(0),
@@ -184,8 +236,9 @@ impl HttpClient {
             if let Some(s) = self.session.borrow().as_ref() {
                 head.push_str(&format!("MCP-Session-Id: {s}\r\n"));
             }
-            if let Some(a) = &self.authorization {
-                head.push_str(&format!("Authorization: {a}\r\n"));
+            for (key, value) in &self.headers {
+                use std::fmt::Write as _;
+                let _ = write!(head, "{key}: {value}\r\n");
             }
             head.push_str("\r\n");
             stream

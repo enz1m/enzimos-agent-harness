@@ -3,8 +3,11 @@
 //! enzimos-inference-service and provider routing in enzimos-ai-gateway; the
 //! shell owns presentation.
 mod attachment;
+mod clock;
+mod command_policy;
 mod desktop;
 mod device;
+mod extensions;
 pub mod http_mcp;
 mod local;
 pub mod mcp;
@@ -14,6 +17,7 @@ mod screenshot;
 pub mod service;
 pub mod skills;
 pub mod tools;
+mod web_fetch;
 
 /// Internal refusal; callers only see generic codes.
 #[derive(Debug, Clone, PartialEq, Eq)]

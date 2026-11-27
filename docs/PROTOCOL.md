@@ -32,6 +32,25 @@ autostart entries, systemd user units, `environment.d`) are excluded from file
 tools and command mounts even within an approved root.
 Additional `protected_paths` may contain up to32 absolute paths.
 
+Settings manages custom entries in the private harness state over
+`extensions.list` and `extensions.change`. Use `kind: "server"` with a
+`name` or `kind: "skill"` with a `path`. The supported actions are
+`add`, `enable` with an `enabled` boolean, and `remove`.
+For a server, `add` also takes a `config` with `enabled` and
+`transport`. Use `argv` and optional `environment` for stdio, or
+`url` and optional `headers` for Streamable HTTP. List responses omit
+connection parameters and secrets. Changes apply to subsequent turns.
+
+The model can request an exact, one-time approval to register an extension
+with `add_extension`. It can also save pasted skill instructions to a configured writable skills folder. Local commands run with account permissions during
+MCP discovery. Skill registration adds instruction folders and does not run
+scripts. Use Settings to enter server credentials.
+
+The scratch tools use the private `enzimos-assistant/scratch` directory
+under `XDG_CACHE_HOME`. The harness sweeps files older than 24 hours at startup
+and every 30 minutes. `command` can use the scratch directory with
+`scratch: true`, with the same sandbox and review policy as workspace commands.
+
 ## Sessions and turns
 
 - `session.create`: workspace, model, optional provider, profile, approval_mode
@@ -44,7 +63,9 @@ Additional `protected_paths` may contain up to32 absolute paths.
   `confirm_full_send: true` for Full send. Only idle sessions can change mode.
   `ask` prompts for writes, commands, MCP and the first screenshot.
   `workspace_edits` also permits writes through the workspace file tool.
-  `full_send` skips harness prompts. Sandbox and portal restrictions still apply.
+  `full_send` skips routine harness prompts. Writable and network-enabled commands,
+  destructive commands, bulk workspace changes, and custom MCP calls need exact
+  approval. Tool approval events carry `reason` and `once_only` for these calls.
   `enzui.approval_default` picks the default for new sessions. A Full send
   preference starts in Ask until explicitly confirmed through the live request.
   Full send resumes as Ask after closing the live session.
@@ -74,7 +95,8 @@ Additional `protected_paths` may contain up to32 absolute paths.
 - `model.warmup`: optional session_id. Ask the local inference service to load
   the pinned model or the automatic text model for an idle chat. With no
   session, use the new-chat settings. The result reports `warmed`. Preloading
-  may be skipped and never sends a prompt or contacts a remote provider.
+  may be skipped. It can prefill the static system instructions and tool schema
+  locally. Conversation messages and remote providers are outside warm-up.
 - `turn.start`: session_id, prompt, and optional `skills: [{name, sha256}]` (max8).
   The optional `attachments` array accepts up to three entries, each with a
   `name` and either `text` (4 KiB total) or `jpeg` (base64, at most 128 KiB
@@ -110,7 +132,7 @@ A cancelled, timed-out or failed turn answers its open tool calls with a
 `tool-call-cancelled` result, so the transcript stays a valid conversation.
 Stored transcripts drop the oldest whole turns at 640 KiB. Before requesting
 one of the bundled local models, the harness trims old turns from the model's
-view to fit a 10 KiB request budget for messages, instructions, and schemas.
+view to fit a request budget for messages, instructions and schemas. The budget scales with the local model’s reported context size.
 Tool results have a 3 KiB limit for those models and a 96 KiB limit for other
 models. Cut results carry a `truncated` marker.
 

@@ -16,7 +16,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     rc::Rc,
     time::Duration,
@@ -70,6 +70,8 @@ pub struct Service {
     active: Cell<usize>,
     busy: RefCell<HashSet<String>>,
     skills: Skills,
+    scratch: Option<Rc<Workspace>>,
+    extensions: Rc<crate::extensions::Extensions>,
     protected: Vec<PathBuf>,
 }
 
@@ -311,6 +313,29 @@ impl Service {
             .ok_or_else(|| ToolError("invalid protected service paths".into()))?;
         paths.extend(configured);
         let skills = Skills::new(config.get("skill_directories").unwrap_or(&json!([])))?;
+        let scratch = gateway.as_ref().and_then(|_| {
+            let cache = std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| home().join(".cache"));
+            let root = cache.join("enzimos-assistant");
+            let path = root.join("scratch");
+            paths.push(path.clone());
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&root)
+                .ok()?;
+            private_directory(&root).ok()?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&path)
+                .ok()?;
+            private_directory(&path).ok()?;
+            Workspace::new(&path, &[]).ok().map(Rc::new)
+        });
+        let extensions = Rc::new(crate::extensions::Extensions::new(&state, &config)?);
         Ok(Rc::new(Self {
             config,
             state,
@@ -321,6 +346,8 @@ impl Service {
             active: Cell::new(0),
             busy: RefCell::new(HashSet::new()),
             skills,
+            scratch,
+            extensions,
             protected: paths,
         }))
     }
@@ -681,7 +708,9 @@ impl Service {
                 self.sessions.borrow_mut().remove(&id);
                 return Ok(json!({"deleted": true}));
             }
-            "skills.list" => return self.skills.discover(),
+            "extensions.list" => return Ok(self.extensions.summary()),
+            "extensions.change" => return self.extensions.change(request),
+            "skills.list" => return self.extensions.skills(&self.skills).discover(),
             "skills.create" => {
                 let directory = Self::text(request, "directory")?;
                 if !self.config["writable_skill_directories"]
@@ -823,9 +852,27 @@ impl Service {
         let Some(gateway) = &self.gateway else {
             return Ok(json!({"warmed": false}));
         };
-        gateway
-            .warmup(model.as_str().filter(|name| !name.is_empty()))
-            .await
+        let model = if let Some(model) = model.as_str().filter(|name| !name.is_empty()) {
+            Some(model.to_owned())
+        } else {
+            crate::local::pick_model(
+                &gateway.local_models().await?,
+                crate::local::Task::Text,
+                false,
+            )
+        };
+        let mcp = Mcp::new(json!({}))?;
+        if !crate::device::legacy_enabled() {
+            let _ = mcp.start_center(false).await;
+        }
+        let prefix = model
+            .as_deref()
+            .and_then(|model| runtime::static_prefix(model, &mcp.schemas.borrow()));
+        mcp.close().await;
+        if self.active.get() != 0 {
+            return Ok(json!({"warmed": false}));
+        }
+        gateway.warmup(model.as_deref(), prefix).await
     }
 
     async fn send(writer: &mut OwnedWriteHalf, body: &Value) -> Result<()> {
@@ -901,13 +948,16 @@ impl Service {
             }
         };
         // Fallible setup runs before the session is marked busy.
-        let mcp = Rc::new(Mcp::new(
-            self.config.get("mcp_servers").cloned().unwrap_or(json!({})),
-        )?);
+        let mcp = Rc::new(Mcp::new(self.extensions.servers())?);
         self.active.set(self.active.get() + 1);
         self.busy.borrow_mut().insert(id.clone());
         let (queue, mut events) = tokio::sync::mpsc::channel(256);
-        session.borrow_mut().observers.push(queue);
+        {
+            let mut session = session.borrow_mut();
+            session.observers.push(queue);
+            session.scratch.clone_from(&self.scratch);
+            session.extensions = verified_desktop.then(|| Rc::clone(&self.extensions));
+        }
         let task = {
             let (service, session, mcp, request) =
                 (self.clone(), session.clone(), mcp.clone(), request.clone());
@@ -930,7 +980,7 @@ impl Service {
                         if !valid {
                             return fail("invalid selected skill");
                         }
-                        let skill = service.skills.load(
+                        let skill = service.extensions.skills(&service.skills).load(
                             choice["name"].as_str().unwrap_or_default(),
                             choice["sha256"].as_str().unwrap_or_default(),
                         )?;
@@ -943,7 +993,9 @@ impl Service {
                     mcp.start().await?;
                     let configured = !mcp.schemas.borrow().is_empty();
                     if verified_desktop && !crate::device::legacy_enabled() {
-                        let _ = mcp.start_center().await;
+                        let _ = mcp
+                            .start_center(crate::local::Task::uses_browser(&prompt))
+                            .await;
                     }
                     let active = (!mcp.schemas.borrow().is_empty()).then_some(&*mcp);
                     let (automatic, task, screenshots) = {
@@ -966,12 +1018,20 @@ impl Service {
                     if screen_request && screenshots == Access::Off {
                         return fail(crate::screenshot::ACCESS_OFF);
                     }
+                    let catalog = if session.borrow().provider == "local" {
+                        match &service.gateway {
+                            Some(gateway) => gateway.local_models().await.ok(),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
                     let model = if automatic {
-                        let gateway = service.gateway.as_ref().ok_or_else(|| {
+                        let catalog = catalog.as_ref().ok_or_else(|| {
                             ToolError(crate::provider::LOCAL_MODELS_UNAVAILABLE.into())
                         })?;
                         crate::local::pick_model(
-                            &gateway.local_models().await?,
+                            catalog,
                             task,
                             has_images || (screen_request && screenshots == Access::Vision),
                         )
@@ -1002,6 +1062,11 @@ impl Service {
                     {
                         return fail(crate::screenshot::VISION_REQUIRED);
                     }
+                    let context_tokens = catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog["data"].as_array())
+                        .and_then(|models| models.iter().find(|entry| entry["id"] == model))
+                        .and_then(|entry| entry["context"].as_u64());
                     runtime::run_configured(
                         &session,
                         &prompt,
@@ -1015,6 +1080,7 @@ impl Service {
                             attachments,
                             replace,
                             verified_desktop,
+                            context_tokens,
                         },
                     )
                     .await
@@ -1214,6 +1280,10 @@ impl Service {
                 | crate::screenshot::VISION_REQUIRED
                 | crate::attachment::INVALID
                 | crate::attachment::VISION_REQUIRED
+                | crate::extensions::INVALID
+                | crate::extensions::DUPLICATE
+                | crate::extensions::LIMIT
+                | crate::extensions::UNAVAILABLE
                 | "local-context-limit"
                 | "stale-turn-revision" => error.0.as_str(),
                 _ => "request-unavailable",
@@ -1225,8 +1295,25 @@ impl Service {
     }
 
     pub async fn serve(self: Rc<Self>, listener: UnixListener) {
+        if self.gateway.is_some() {
+            let service = Rc::clone(&self);
+            tokio::task::spawn_local(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(45), service.warmup(&Value::Null))
+                    .await;
+            });
+        }
+        let mut sweep = tokio::time::interval(Duration::from_secs(30 * 60));
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
+            let accepted = tokio::select! {
+                accepted = listener.accept() => accepted,
+                _ = sweep.tick(), if self.scratch.is_some() => {
+                    if let Some(scratch) = &self.scratch {
+                        crate::tools::sweep_scratch(scratch);
+                    }
+                    continue;
+                }
+            };
+            let Ok((stream, _)) = accepted else {
                 // Back off on descriptor exhaustion instead of spinning.
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;

@@ -130,11 +130,15 @@ impl Skills {
         let mut rows = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for directory in &self.directories {
-            let mut children = std::fs::read_dir(directory)
-                .map_err(|_| ToolError("skill directory unavailable".into()))?
-                .flatten()
-                .map(|e| e.path())
-                .collect::<Vec<_>>();
+            let mut children = if directory.join("SKILL.md").is_file() {
+                vec![directory.clone()]
+            } else {
+                std::fs::read_dir(directory)
+                    .map_err(|_| ToolError("skill directory unavailable".into()))?
+                    .flatten()
+                    .map(|e| e.path())
+                    .collect::<Vec<_>>()
+            };
             children.sort();
             for child in children {
                 let Ok(m) = std::fs::symlink_metadata(&child) else {
@@ -166,7 +170,13 @@ impl Skills {
         }
         let mut matches = Vec::new();
         for directory in &self.directories {
-            let child = directory.join(name);
+            let child = if directory.file_name().is_some_and(|folder| folder == name)
+                && directory.join("SKILL.md").is_file()
+            {
+                directory.clone()
+            } else {
+                directory.join(name)
+            };
             if std::fs::symlink_metadata(&child).is_ok_and(|m| m.file_type().is_symlink()) {
                 return fail("skill folder symlink refused");
             }
