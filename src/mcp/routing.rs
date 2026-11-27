@@ -39,6 +39,14 @@ pub(super) fn named_app(prompt: &str, name: &str) -> bool {
     mentions(prompt, name)
 }
 
+pub(super) fn app_label<'a>(id: &str, registered_name: &'a str) -> &'a str {
+    if id == "org.enzim.Browser" {
+        "Browser"
+    } else {
+        registered_name
+    }
+}
+
 pub(super) fn expected_apps(prompt: &str) -> impl Iterator<Item = &'static str> + '_ {
     [
         "Mail",
@@ -163,7 +171,10 @@ pub(super) fn alias(app: &Value, id: &str) -> String {
 pub(super) fn rank(app: &Value, function: &Value, prompt: &str) -> u32 {
     let id = function["id"].as_str().unwrap_or_default();
     let lower = prompt.to_lowercase();
-    let name = app["name"].as_str().unwrap_or_default();
+    let name = app_label(
+        app["id"].as_str().unwrap_or_default(),
+        app["name"].as_str().unwrap_or_default(),
+    );
     if app["id"] == SETTINGS {
         return match id {
             "settings.search" | "settings.read" if setting_intent(&lower) => 40,
@@ -405,6 +416,15 @@ pub(super) fn parameters(app: &str, id: &str, schema: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_short_name_ranks_native_open_and_read() {
+        let browser = json!({"id": "org.enzim.Browser", "name": "enzim Browser"});
+        let prompt = "Open https://example.com/ in Browser and read its heading";
+        for function in ["new_page", "take_snapshot"] {
+            assert!(rank(&browser, &json!({"id": function}), prompt) > 0);
+        }
+    }
 
     #[test]
     fn a_page_already_open_in_browser_does_not_request_an_app_launch() {

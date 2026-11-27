@@ -397,7 +397,9 @@ impl Mcp {
             let (Some(id), Some(name)) = (app["id"].as_str(), app["name"].as_str()) else {
                 continue;
             };
-            if id != "dev.enzui.Settings" && !routing::named_app(prompt, name) {
+            let label = routing::app_label(id, name);
+            let requested = routing::named_app(prompt, label);
+            if id != "dev.enzui.Settings" && !requested {
                 continue;
             }
             let listing =
@@ -413,9 +415,9 @@ impl Mcp {
                 })
                 .collect::<Vec<_>>();
             choices.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
-            if routing::named_app(prompt, name) {
+            if requested {
                 availability.push(json!({"app":name,"app_id":id,"installed":app["installed"],
-                    "running":app["running"],"capabilities":[],"missing":routing::requested_capability(name, prompt)}));
+                    "running":app["running"],"capabilities":[],"missing":routing::requested_capability(label, prompt)}));
             }
             let limit = if id == "dev.enzui.Settings" { 7 } else { 3 };
             candidates.extend(
@@ -427,9 +429,10 @@ impl Mcp {
         }
         for name in routing::expected_apps(prompt) {
             if !availability.iter().any(|row| {
-                row["app"]
-                    .as_str()
-                    .is_some_and(|app| app.eq_ignore_ascii_case(name))
+                row["app_id"].as_str() == routing::desktop_id(name)
+                    || row["app"]
+                        .as_str()
+                        .is_some_and(|app| app.eq_ignore_ascii_case(name))
             }) {
                 availability.push(missing_app(name, prompt));
             }
