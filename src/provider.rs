@@ -159,6 +159,7 @@ pub struct Assembler {
     calls: Vec<Value>,
     bytes: usize,
     output_limit: bool,
+    finished_choice: bool,
     /// The stream's end marker arrived; a stream cut short has none.
     pub done: bool,
 }
@@ -196,6 +197,7 @@ impl Assembler {
                 });
             }
             let choice = &chunk["choices"][0];
+            self.finished_choice |= choice["finish_reason"].is_string();
             self.output_limit |= choice["finish_reason"] == "length";
             let delta = &choice["delta"];
             for key in ["reasoning_content", "reasoning"] {
@@ -385,6 +387,8 @@ impl Gateway {
         if raw.len() > LIMIT {
             return fail("provider request exceeds limit");
         }
+        let session = body["conversation_id"].as_str().unwrap_or("-");
+        let start = std::time::Instant::now();
         let exchange = async {
             let stream = self.connect().await?;
             let (reader, mut writer) = stream.into_split();
@@ -398,6 +402,7 @@ impl Gateway {
                 .map_err(|_| ToolError(GATEWAY_UNAVAILABLE.into()))?;
             let mut reader = BufReader::new(reader);
             let (status, headers) = read_head(&mut reader).await?;
+            crate::timing::phase(session, "provider_headers", start);
             if status != 200 {
                 if has_image {
                     if matches!(status, 400 | 415 | 422) {
@@ -420,8 +425,21 @@ impl Gateway {
                 .is_some_and(|t| t.starts_with("text/event-stream"));
             if streamed {
                 let mut assembler = Assembler::default();
+                let mut first_text = true;
                 read_body_with(&mut reader, &headers, LIMIT, &mut |bytes| {
+                    let was_done = assembler.done;
+                    let had_final_choice = assembler.finished_choice;
                     let (reasoning, content) = assembler.feed(bytes)?;
+                    if !had_final_choice && assembler.finished_choice {
+                        crate::timing::phase(session, "provider_finish_reason", start);
+                    }
+                    if first_text && !content.is_empty() {
+                        first_text = false;
+                        crate::timing::phase(session, "provider_first_text", start);
+                    }
+                    if !was_done && assembler.done {
+                        crate::timing::phase(session, "provider_done_marker", start);
+                    }
                     if !reasoning.is_empty() {
                         delta("reasoning", &reasoning);
                     }
@@ -431,6 +449,7 @@ impl Gateway {
                     Ok(())
                 })
                 .await?;
+                crate::timing::phase(session, "provider_body_end", start);
                 if !assembler.done {
                     return fail("selected provider response unavailable");
                 }

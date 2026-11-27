@@ -583,7 +583,10 @@ async fn approval(
         request_id,
         allow: None,
     };
-    let allowed = match tokio::time::timeout(Duration::from_secs(90), receiver).await {
+    let start = Instant::now();
+    let decision = tokio::time::timeout(Duration::from_secs(90), receiver).await;
+    crate::timing::phase(&session.borrow().id, "approval", start);
+    let allowed = match decision {
         Ok(Ok(ApprovalDecision::Session)) => {
             session.borrow_mut().allowed_tools.insert(grant.to_owned());
             true
@@ -906,6 +909,7 @@ async fn invoke(
         Err(error) => ("failed", model_error(error).to_owned()),
     };
     let duration_ms = started.elapsed().as_millis() as u64;
+    crate::timing::phase(&session.borrow().id, "tool", started);
     session.borrow_mut().emit("tool.completed", json!({"call_id": call_id, "tool": name, "status": status, "duration_ms": duration_ms, "output": output}));
     outcome
 }
@@ -1213,6 +1217,7 @@ pub(crate) async fn run_configured(
         let mut used_device = false;
         let mut setting_search_incomplete = false;
         for _ in 0..max_steps {
+            let prepare = Instant::now();
             let mut messages = {
                 let mut s = session.borrow_mut();
                 if s.take_steers()
@@ -1388,6 +1393,7 @@ pub(crate) async fn run_configured(
             let direct_read = direct
                 .as_ref()
                 .is_some_and(|(name, _)| *name == "file_read");
+            crate::timing::phase(&session.borrow().id, "prepare_round", prepare);
             let message = match direct {
                 Some((name, arguments)) => Ok(assistant(
                     "",
@@ -1396,7 +1402,12 @@ pub(crate) async fn run_configured(
                         "function": {"name": name, "arguments": arguments.to_string()}
                     })],
                 )),
-                None => complete_step(session, model, complete, request, image.take(), delta).await,
+                None => {
+                    let start = Instant::now();
+                    let result = complete_step(session, model, complete, request, image.take(), delta).await;
+                    crate::timing::phase(&session.borrow().id, "model_round", start);
+                    result
+                }
             };
             close_thinking(&mut session.borrow_mut(), &thinking);
             let mut message = message?;

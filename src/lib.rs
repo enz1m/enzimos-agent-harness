@@ -16,6 +16,7 @@ pub mod runtime;
 mod screenshot;
 pub mod service;
 pub mod skills;
+mod timing;
 pub mod tools;
 mod web_fetch;
 

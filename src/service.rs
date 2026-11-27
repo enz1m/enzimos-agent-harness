@@ -964,6 +964,8 @@ impl Service {
             tokio::task::spawn_local(async move {
                 // One deadline and cancellation owner covers discovery and execution.
                 let work = async {
+                    let session_id = session.borrow().id.clone();
+                    let start = std::time::Instant::now();
                     let selected = request.get("skills").cloned().unwrap_or(json!([]));
                     let selected = selected
                         .as_array()
@@ -990,12 +992,18 @@ impl Service {
                     if instructions.len() > 131072 {
                         return fail("selected skills exceed context limit");
                     }
-                    mcp.start().await?;
+                    crate::timing::phase(&session_id, "prepare_inputs", start);
+                    let start = std::time::Instant::now();
+                    let discovery = mcp.start().await;
+                    crate::timing::phase(&session_id, "discover_extensions", start);
+                    discovery?;
                     let configured = !mcp.schemas.borrow().is_empty();
                     if verified_desktop && !crate::device::legacy_enabled() {
+                        let start = std::time::Instant::now();
                         let _ = mcp
                             .start_center(crate::local::Task::uses_browser(&prompt))
                             .await;
+                        crate::timing::phase(&session_id, "discover_center", start);
                     }
                     let active = (!mcp.schemas.borrow().is_empty()).then_some(&*mcp);
                     let (automatic, task, screenshots) = {
@@ -1018,6 +1026,7 @@ impl Service {
                     if screen_request && screenshots == Access::Off {
                         return fail(crate::screenshot::ACCESS_OFF);
                     }
+                    let start = std::time::Instant::now();
                     let catalog = if session.borrow().provider == "local" {
                         match &service.gateway {
                             Some(gateway) => gateway.local_models().await.ok(),
@@ -1026,6 +1035,7 @@ impl Service {
                     } else {
                         None
                     };
+                    crate::timing::phase(&session_id, "model_catalog", start);
                     let model = if automatic {
                         let catalog = catalog.as_ref().ok_or_else(|| {
                             ToolError(crate::provider::LOCAL_MODELS_UNAVAILABLE.into())
