@@ -564,6 +564,10 @@ fn socket_path() -> Option<PathBuf> {
         .then(|| runtime.join("enzui-assistant-control.sock"))
 }
 
+pub(crate) fn legacy_enabled() -> bool {
+    std::env::var_os("ENZIMOS_ASSISTANT_LEGACY_DEVICE").is_some_and(|value| value == "1")
+}
+
 pub(crate) fn available() -> bool {
     socket_path()
         .and_then(|path| std::fs::symlink_metadata(path).ok())

@@ -74,7 +74,12 @@ Skills add instructions to a turn. The harness checks the selected skill
 against its SHA-256 before the turn starts. The session keeps the same tool
 permissions after loading a skill.
 
-Enable MCP servers explicitly in the private configuration. The harness
+In a verified enzimOS Assistant turn, the harness discovers the built-in
+desktop functions through the MCP Center. The Center approves each requested
+change separately. Set `ENZIMOS_ASSISTANT_LEGACY_DEVICE=1` in the harness
+environment to opt into the old desktop keyword router.
+
+Enable additional MCP servers in the private configuration. The harness
 supports stdio and Streamable HTTP over verified HTTPS or literal loopback
 HTTP. Stdio executables run as your user, outside the command sandbox. External
 tool calls follow the conversation’s approval mode. When using MCP Center, its enrollment and

@@ -71,7 +71,7 @@ fn tools_schema(screenshots: Access) -> Vec<Value> {
     tools
 }
 
-const ACTION_DECLINED: &str = "tool action declined or approval expired";
+pub(crate) const ACTION_DECLINED: &str = "tool action declined or approval expired";
 // Only allow-listed failures can expose details to the provider and transcript.
 const CORRECTABLE: &[(&str, &str)] = &[
     (
@@ -105,6 +105,14 @@ const CORRECTABLE: &[(&str, &str)] = &[
     ),
     (desktop::UNAVAILABLE, desktop::UNAVAILABLE),
     (desktop::INVALID, desktop::INVALID),
+    (
+        crate::mcp::CENTER_UNAVAILABLE,
+        crate::mcp::CENTER_UNAVAILABLE,
+    ),
+    (
+        "Invalid setting or tool arguments.",
+        "Invalid setting or tool arguments.",
+    ),
     (device::LOCKED, device::LOCKED),
     (device::UNAVAILABLE, device::UNAVAILABLE),
     (device::TIMER_LIMIT, device::TIMER_LIMIT),
@@ -577,8 +585,10 @@ async fn invoke(
         None if mcp.is_some_and(|m| m.has(name)) => {}
         None => return fail("unknown tool"),
     }
+    let center_tool = mcp.is_some_and(|m| m.uses_center(name));
     let grant = match &builtin {
         Some(_) => format!("builtin:{name}"),
+        None if center_tool => String::new(),
         None => mcp.unwrap().approval_identity(name),
     };
     let arguments_value = Value::Object(arguments.clone());
@@ -586,6 +596,7 @@ async fn invoke(
     let needs_approval = device_tool.map_or_else(
         || {
             !desktop_tool
+                && !center_tool
                 && session
                     .borrow()
                     .needs_approval(name, &arguments_value, &grant)
@@ -863,9 +874,20 @@ pub(crate) async fn run_configured(
             screenshots
         },
     );
+    let mut center_schemas = Vec::new();
     if let Some(mcp) = mcp {
-        tools.extend(mcp.schemas.borrow().iter().cloned());
+        for tool in mcp.schemas.borrow().iter() {
+            if tool["function"]["name"]
+                .as_str()
+                .is_some_and(|name| mcp.uses_center(name))
+            {
+                center_schemas.push(tool.clone());
+            } else {
+                tools.push(tool.clone());
+            }
+        }
     }
+    let center_instructions = "Use desktop tools for live readings and requested desktop actions. For settings, search with a short English name (Night Light, Dark mode, brightness, scale), then use the returned id and allowed values. Use open_app to open an app or folder. Use find_downloads to search filenames. Pass today or yesterday for relative dates. Report changes only after a successful tool result. Answer in the user's language.";
     let full_tools = tools;
     {
         let mut s = session.borrow_mut();
@@ -973,7 +995,7 @@ pub(crate) async fn run_configured(
                 },
                 instructions.unwrap_or_default(),
                 &full_tools,
-                desktop_generation.is_some() && !answer_read,
+                (desktop_generation.is_some() || !center_schemas.is_empty()) && !answer_read,
             );
             let (instructions, profile_tools) = match &local {
                 Some(profile) => (
@@ -982,7 +1004,22 @@ pub(crate) async fn run_configured(
                 ),
                 None => (instructions, full_tools.as_slice()),
             };
-            let mut tools = profile_tools.to_vec();
+            let system;
+            let instructions = if center_schemas.is_empty() || answer_read {
+                instructions
+            } else {
+                system = format!(
+                    "{}\n{center_instructions}",
+                    instructions.unwrap_or_default()
+                );
+                Some(system.as_str())
+            };
+            let mut tools = if answer_read {
+                Vec::new()
+            } else {
+                center_schemas.clone()
+            };
+            tools.extend_from_slice(profile_tools);
             if let Some(tool) = device_tool {
                 tools.push(tool.schema());
             }

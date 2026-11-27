@@ -941,10 +941,14 @@ impl Service {
                         return fail("selected skills exceed context limit");
                     }
                     mcp.start().await?;
+                    let configured = !mcp.schemas.borrow().is_empty();
+                    if verified_desktop && !crate::device::legacy_enabled() {
+                        let _ = mcp.start_center().await;
+                    }
                     let active = (!mcp.schemas.borrow().is_empty()).then_some(&*mcp);
                     let (automatic, task, screenshots) = {
                         let session = session.borrow();
-                        let task = if selected.is_empty() && active.is_none() {
+                        let task = if selected.is_empty() && !configured {
                             let history = replace
                                 .map_or(session.messages.as_slice(), |i| &session.messages[..i]);
                             crate::local::Task::from_turn(&prompt, history)

@@ -192,6 +192,10 @@ impl Task {
     }
 
     pub(crate) fn classify(prompt: &str, follows_tools: bool) -> Self {
+        Self::classify_with_device(prompt, follows_tools, device::legacy_enabled())
+    }
+
+    fn classify_with_device(prompt: &str, follows_tools: bool, legacy_device: bool) -> Self {
         if Self::asks_for_screenshot(prompt) {
             return Self::Screen;
         }
@@ -216,7 +220,7 @@ impl Task {
         {
             return Self::Full;
         }
-        if let Some(tool) = device::Tool::classify(&words, first_action.copied()) {
+        if legacy_device && let Some(tool) = device::Tool::classify(&words, first_action.copied()) {
             return Self::Device(tool);
         }
         let file = words.iter().any(|word| {
@@ -415,22 +419,27 @@ pub(crate) fn pick_model(catalog: &Value, task: Task, prefer_vision: bool) -> Op
         return Some(Profile::VISION_MODEL.to_owned());
     }
     let id = |entry: &Value| entry["id"].as_str().map(str::to_owned);
-    let workspace = if matches!(task, Task::Text | Task::Screen | Task::Device(_)) {
-        None
-    } else {
-        [Profile::VISION_MODEL, "qwen3.5-0.8b", "minicpm5-1b"]
-            .into_iter()
-            .find(|name| text_models.clone().any(|model| model["id"] == *name))
-            .map(str::to_owned)
+    let preferred = [Profile::VISION_MODEL, "minicpm5-1b"]
+        .into_iter()
+        .find(|name| text_models.clone().any(|model| model["id"] == *name))
+        .map(str::to_owned);
+    let default = || {
+        text_models
+            .clone()
+            .find(|model| model["default"] == true && model["id"] != "qwen3.5-0.8b")
+            .and_then(id)
     };
-    workspace
-        .or_else(|| {
-            text_models
-                .clone()
-                .find(|model| model["default"] == true)
-                .and_then(id)
-        })
-        .or_else(|| text_models.filter_map(id).next())
+    match task {
+        Task::Text | Task::Screen | Task::Device(_) => default().or(preferred),
+        _ => preferred.or_else(default),
+    }
+    .or_else(|| {
+        text_models
+            .clone()
+            .filter(|model| model["id"] != "qwen3.5-0.8b")
+            .find_map(id)
+    })
+    .or_else(|| text_models.filter_map(id).next())
 }
 
 #[cfg(test)]
@@ -450,7 +459,7 @@ mod tests {
         );
         assert_eq!(
             pick_model(&catalog, Task::Files, false).as_deref(),
-            Some("qwen3.5-0.8b")
+            Some("minicpm5-1b")
         );
         let mut catalog = catalog;
         catalog["data"]
@@ -464,6 +473,22 @@ mod tests {
         assert_eq!(
             pick_model(&catalog, Task::Text, false).as_deref(),
             Some("minicpm5-1b")
+        );
+    }
+
+    #[test]
+    fn qwen_legacy_registry_stays_usable_without_taking_precedence() {
+        let qwen = json!({"id": "qwen3.5-0.8b", "kind": "llm", "default": true});
+        let lfm = json!({"id": Profile::VISION_MODEL, "kind": "llm"});
+        let old = json!({"data":[qwen]});
+        let upgraded = json!({"data":[qwen, lfm]});
+        assert_eq!(
+            pick_model(&old, Task::Text, false).as_deref(),
+            Some("qwen3.5-0.8b")
+        );
+        assert_eq!(
+            pick_model(&upgraded, Task::Text, false).as_deref(),
+            Some(Profile::VISION_MODEL)
         );
     }
 
@@ -534,7 +559,7 @@ mod tests {
         ];
         for (prompt, expected) in cases {
             assert_eq!(
-                Task::classify(prompt, false).direct_tool(prompt),
+                Task::classify_with_device(prompt, false, true).direct_tool(prompt),
                 expected,
                 "{prompt}"
             );
@@ -559,7 +584,7 @@ mod tests {
         );
         assert!(Task::classify("What is a battery?", false) == Task::Text);
         assert!(
-            Task::classify("How much RAM is this computer using?", false)
+            Task::classify_with_device("How much RAM is this computer using?", false, true)
                 == Task::Device(device::Tool::Status)
         );
         for request in [
@@ -567,10 +592,13 @@ mod tests {
             "Enable dark mode.",
             "Activa el modo oscuro.",
         ] {
-            assert!(Task::classify(request, false) == Task::Device(device::Tool::Setting));
+            assert!(
+                Task::classify_with_device(request, false, true)
+                    == Task::Device(device::Tool::Setting)
+            );
         }
         assert!(
-            Task::classify("Locate the ZIP I downloaded yesterday", false)
+            Task::classify_with_device("Locate the ZIP I downloaded yesterday", false, true)
                 == Task::Device(device::Tool::Downloads)
         );
         assert!(Task::classify("Read todo.txt", false) == Task::Files);

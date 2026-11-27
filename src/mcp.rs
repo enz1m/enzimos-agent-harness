@@ -182,6 +182,25 @@ impl StdioClient {
         result
     }
 
+    async fn close_center(&self) {
+        let process = self.process.lock().await.take();
+        if let Some(Process {
+            mut child,
+            stdin,
+            stdout: _stdout,
+        }) = process
+        {
+            drop(stdin);
+            if tokio::time::timeout(Duration::from_millis(300), child.wait())
+                .await
+                .is_ok()
+            {
+                self.group.set(None);
+            }
+        }
+        self.close().await;
+    }
+
     #[allow(unsafe_code, reason = "Linux syscall ABI (kill).")]
     pub async fn close(&self) {
         if let Some(group) = self.group.take() {
@@ -235,6 +254,8 @@ pub struct Mcp {
     clients: RefCell<Vec<Rc<Client>>>,
     routes: RefCell<BTreeMap<String, (Rc<Client>, String)>>,
     pub schemas: RefCell<Vec<Value>>,
+    center: RefCell<Option<Rc<StdioClient>>>,
+    center_routes: RefCell<BTreeMap<String, &'static str>>,
     approval_identities: RefCell<BTreeMap<String, String>>,
 }
 
@@ -263,12 +284,75 @@ impl Mcp {
             clients: RefCell::new(vec![]),
             routes: RefCell::new(BTreeMap::new()),
             schemas: RefCell::new(vec![]),
+            center: RefCell::default(),
+            center_routes: RefCell::default(),
             approval_identities: RefCell::default(),
         })
     }
 
     pub fn has(&self, alias: &str) -> bool {
-        self.routes.borrow().contains_key(alias)
+        self.routes.borrow().contains_key(alias) || self.uses_center(alias)
+    }
+
+    pub(crate) fn uses_center(&self, alias: &str) -> bool {
+        self.center_routes.borrow().contains_key(alias)
+    }
+
+    pub(crate) async fn start_center(&self) -> Result<()> {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| ToolError(CENTER_UNAVAILABLE.into()))?;
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let state = std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| home.map(|path| path.join(".local/state")))
+            .ok_or_else(|| ToolError(CENTER_UNAVAILABLE.into()))?;
+        let credential = state.join("enzui/agents/dev.enzui.Assistant.credential.json");
+        let socket = runtime.join("enzui/center.sock");
+        if !credential.is_file() || !socket.exists() {
+            return fail(CENTER_UNAVAILABLE);
+        }
+        let binary = std::env::current_exe()
+            .ok()
+            .map(|path| path.with_file_name("enzui-mcp"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| "/usr/bin/enzui-mcp".into());
+        let client = StdioClient::new(
+            &json!([binary, "--socket", socket, "--credential", credential]),
+            &Value::Null,
+        )?;
+        client.start().await?;
+        let mut schemas = Vec::new();
+        let mut routes = BTreeMap::new();
+        // Inspection is independent of the prompt and preserves the order of the model prefix.
+        for (alias, id) in CENTER_TOOLS {
+            let reply = client
+                .request(
+                    "tools/call",
+                    json!({
+                        "name":"enzui_function",
+                        "arguments":{"app_id":SETTINGS_APP, "function_id":id}
+                    }),
+                )
+                .await?;
+            let function = &center_result(&reply)?["function"];
+            if function["id"] != *id || function["input_schema"]["type"] != "object" {
+                return fail(CENTER_UNAVAILABLE);
+            }
+            if self.has(alias) {
+                return fail("duplicate MCP tool alias");
+            }
+            schemas.push(json!({"type":"function","function":{
+                "name":alias,"description":function["description"],"parameters":function["input_schema"]
+            }}));
+            routes.insert((*alias).to_owned(), *id);
+        }
+        self.schemas.borrow_mut().extend(schemas);
+        self.center_routes.replace(routes);
+        self.center.replace(Some(client));
+        Ok(())
     }
 
     pub(crate) fn approval_identity(&self, alias: &str) -> String {
@@ -432,7 +516,20 @@ impl Mcp {
         Ok(())
     }
 
+    /// Calls one discovered tool.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown tool, a refused call or transport failure.
     pub async fn call(&self, alias: &str, arguments: Value) -> Result<Value> {
+        let center_route = self.center_routes.borrow().get(alias).copied();
+        if let Some(id) = center_route {
+            let client = self
+                .center
+                .borrow()
+                .clone()
+                .ok_or_else(|| ToolError(CENTER_UNAVAILABLE.into()))?;
+            return call_center(&client, id, arguments).await;
+        }
         let route = self.routes.borrow().get(alias).cloned();
         let (client, name) = route.ok_or_else(|| ToolError("unknown MCP tool".into()))?;
         client
@@ -445,8 +542,74 @@ impl Mcp {
         for client in clients {
             client.close().await;
         }
+        let center = self.center.take();
+        if let Some(center) = center {
+            center.close_center().await;
+        }
+        self.center_routes.borrow_mut().clear();
         self.routes.borrow_mut().clear();
         self.schemas.borrow_mut().clear();
         self.approval_identities.borrow_mut().clear();
+    }
+}
+
+const SETTINGS_APP: &str = "dev.enzui.Settings";
+pub(crate) const CENTER_UNAVAILABLE: &str = "The desktop MCP Center is unavailable.";
+const CENTER_TOOLS: &[(&str, &str)] = &[
+    ("search_settings", "settings.search"),
+    ("get_setting", "settings.read"),
+    ("set_setting", "settings.change"),
+    ("open_app", "desktop.open"),
+    ("start_timer", "desktop.timer"),
+    ("device_status", "desktop.status"),
+    ("find_downloads", "desktop.downloads"),
+];
+
+fn center_result(reply: &Value) -> Result<Value> {
+    if reply["isError"] == true {
+        let error = reply["content"][0]["text"]
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .unwrap_or_default();
+        return fail(match error["code"].as_str() {
+            Some("permission_required") => "center-approval-pending",
+            Some("permission_denied") => crate::runtime::ACTION_DECLINED,
+            Some("invalid_arguments" | "invalid_value" | "invalid") => {
+                "Invalid setting or tool arguments."
+            }
+            Some("locked") => crate::device::LOCKED,
+            Some("no_backlight") => crate::device::NO_BACKLIGHT,
+            Some("app") => crate::device::APP_UNAVAILABLE,
+            Some("folder") => crate::device::FOLDER_UNAVAILABLE,
+            Some("limit") => crate::device::TIMER_LIMIT,
+            _ => CENTER_UNAVAILABLE,
+        });
+    }
+    if let Some(result) = reply.get("structuredContent") {
+        return Ok(result.clone());
+    }
+    reply["content"][0]["text"]
+        .as_str()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .ok_or_else(|| ToolError(CENTER_UNAVAILABLE.into()))
+}
+
+async fn call_center(client: &StdioClient, id: &str, arguments: Value) -> Result<Value> {
+    let request = json!({"name":"enzui_call","arguments":{
+        "app_id":SETTINGS_APP, "function_id":id, "arguments":arguments,
+    }});
+    // Matches the MCP Center's longest call so the user has time to read the consent dialog.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let reply = client.request("tools/call", request.clone()).await?;
+        match center_result(&reply) {
+            Err(error) if error.0 == "center-approval-pending" => {
+                if tokio::time::Instant::now() >= deadline {
+                    return fail(crate::runtime::ACTION_DECLINED);
+                }
+                tokio::time::sleep(Duration::from_millis(750)).await;
+            }
+            result => return result.map(|mut value| value["result"].take()),
+        }
     }
 }
