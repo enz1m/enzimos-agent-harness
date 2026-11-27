@@ -53,8 +53,9 @@ Additional `protected_paths` may contain up to32 absolute paths.
   Text mode sends dimensions and approximate colors. Vision also attaches a
   bounded image to the next model request. Captured pixels are excluded from
   the transcript. Each capture uses the desktop Screenshot portal.
-  Of the bundled local profiles, only LFM3-VL-2B advertises this tool.
-  Automatic selection prefers it while screenshots are enabled, if installed.
+  The bundled text models can request a text summary in Text mode.
+  Automatic selection prefers LFM3-VL-2B for a screenshot requested in Vision
+  mode, if installed.
   Image delivery requires an inference backend serving it with vision enabled.
   For other providers or custom models, choose the mode their backend supports.
 - `session.list`: stored session summaries, each with `title` (first request),
@@ -65,10 +66,15 @@ Additional `protected_paths` may contain up to32 absolute paths.
   records with tool, arguments, output and status). User items list attachment
   names. Send `items_only: true` to omit the raw messages. The export also
   returns `last_turn_revision` for the latest successful turn when available.
-  Delete requires a closed session. Stored transcripts are sensitive,
+  `session.rename`: session_id and title (1–60 characters, single line).
+  Rename and delete require an idle session. Stored transcripts are sensitive,
   including the bytes of any attached documents and images. Each transcript
   is bounded to 2 MiB, with at most 128 sessions.
 - `session.close`: session_id; cancel a running turn first.
+- `model.warmup`: optional session_id. Ask the local inference service to load
+  the pinned model or the automatic text model for an idle chat. With no
+  session, use the new-chat settings. The result reports `warmed`. Preloading
+  may be skipped and never sends a prompt or contacts a remote provider.
 - `turn.start`: session_id, prompt, and optional `skills: [{name, sha256}]` (max8).
   The optional `attachments` array accepts up to three entries, each with a
   `name` and either `text` (4 KiB total) or `jpeg` (base64, at most 128 KiB

@@ -12,11 +12,81 @@ pub(crate) enum Task {
     Text,
     Files,
     Write,
+    Screen,
     Full,
 }
 
 impl Task {
+    pub(crate) fn asks_for_screenshot(prompt: &str) -> bool {
+        let instruction = prompt
+            .split([':', '\n'])
+            .next()
+            .unwrap_or(prompt)
+            .trim()
+            .to_lowercase();
+        let instruction = ["please ", "can you ", "could you "]
+            .iter()
+            .fold(instruction.as_str(), |text, prefix| {
+                text.strip_prefix(prefix).unwrap_or(text)
+            });
+        [
+            "look at my screen",
+            "look at the screen",
+            "what's on my screen",
+        ]
+        .iter()
+        .any(|request| instruction.starts_with(request))
+            || (["take ", "capture ", "grab ", "get "]
+                .iter()
+                .any(|verb| instruction.starts_with(verb))
+                && (instruction.split_whitespace().any(|word| {
+                    word.trim_matches(|ch: char| !ch.is_alphanumeric()) == "screenshot"
+                }) || instruction.contains("screen shot")
+                    || instruction.contains("screen capture")
+                    || instruction.contains("capture the screen")
+                    || instruction.contains("capture my screen")))
+    }
+
+    pub(crate) fn direct_tool(self, prompt: &str) -> Option<(&'static str, Value)> {
+        match self {
+            Self::Screen => {
+                let window = prompt
+                    .split(|ch: char| !ch.is_alphanumeric())
+                    .any(|word| word.eq_ignore_ascii_case("window"));
+                let target = if window { "focused_window" } else { "screen" };
+                Some(("screenshot", json!({"target": target})))
+            }
+            Self::Files => {
+                let mut words = prompt.split_whitespace();
+                let verb = words.next()?;
+                let verb = if verb.eq_ignore_ascii_case("please") {
+                    words.next()?
+                } else {
+                    verb
+                };
+                if !verb.eq_ignore_ascii_case("read") {
+                    return None;
+                }
+                let path = words
+                    .next()?
+                    .trim_end_matches([',', '.', '?', '!', ':'])
+                    .trim_matches(['`', '"', '\'']);
+                if !path.contains(['/', '.'])
+                    || path.starts_with(['/', '~'])
+                    || path.contains("://")
+                {
+                    return None;
+                }
+                Some(("file_read", json!({"path": path})))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn classify(prompt: &str, follows_tools: bool) -> Self {
+        if Self::asks_for_screenshot(prompt) {
+            return Self::Screen;
+        }
         let instruction = prompt.split([':', '\n']).next().unwrap_or(prompt);
         let lower = instruction.trim().to_lowercase();
         let words = lower
@@ -144,14 +214,22 @@ impl Profile {
             });
         }
         let mut instructions = format!("{}{model_prompt}", PROFILES["prompt"].as_str()?);
-        let mut tools = match task {
+        let tools = match task {
             Task::Text => Vec::new(),
+            Task::Screen => full_tools
+                .iter()
+                .filter(|tool| tool["function"]["name"] == "screenshot")
+                .cloned()
+                .collect(),
             Task::Files | Task::Write => {
                 instructions.push_str(PROFILES["workspace"].as_str()?);
-                instructions.push_str(PROFILES["examples"].as_str()?);
+                if task == Task::Write {
+                    instructions.push_str(PROFILES["write"].as_str()?);
+                }
                 PROFILES["tools"]
                     .as_array()?
                     .iter()
+                    .filter(|tool| task == Task::Write || tool["name"] != "file_write")
                     .map(|tool| json!({"type": "function", "function": tool}))
                     .collect()
             }
@@ -161,14 +239,6 @@ impl Profile {
                 full_tools.to_vec()
             }
         };
-        if task != Task::Full && model == Self::VISION_MODEL {
-            tools.extend(
-                full_tools
-                    .iter()
-                    .filter(|tool| tool["function"]["name"] == "screenshot")
-                    .cloned(),
-            );
-        }
         Some(Self {
             instructions,
             tools,
@@ -197,7 +267,7 @@ pub(crate) fn pick_model(catalog: &Value, task: Task, prefer_vision: bool) -> Op
         return Some(Profile::VISION_MODEL.to_owned());
     }
     let id = |entry: &Value| entry["id"].as_str().map(str::to_owned);
-    let workspace = if task == Task::Text {
+    let workspace = if matches!(task, Task::Text | Task::Screen) {
         None
     } else {
         [Profile::VISION_MODEL, "qwen3.5-0.8b", "minicpm5-1b"]

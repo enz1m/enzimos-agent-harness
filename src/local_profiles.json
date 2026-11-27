@@ -1,7 +1,6 @@
 {
-  "prompt": "You are the enzimOS assistant. Follow the requested format exactly. For summaries and rewrites, use only the supplied text. If information is missing, say so.",
-  "workspace": " Use relative workspace paths. Use tools for file requests. Report success only after a successful tool result.",
-  "examples": "\nTool examples: list the workspace → files_list({}); list the drafts folder → files_list({\"path\":\"drafts\"}); read report.md → file_read({\"path\":\"report.md\"}); create hello.txt with Hi → file_write({\"path\":\"hello.txt\",\"text\":\"Hi\"}). To replace a file, read it first and copy its sha256 into expected_sha256.",
+  "prompt": "You are the enzimOS assistant. Follow the requested format. Use earlier messages to resolve follow-ups. For rewrites and summaries, use the supplied text.",
+  "workspace": " Use file tools for workspace requests. Paths are relative. Report success only after a successful tool result.",
   "models": {
     "minicpm5-1b": " Answer directly and briefly.",
     "qwen3.5-0.8b": " Return just the requested answer.",
@@ -69,5 +68,6 @@
         "additionalProperties": false
       }
     }
-  ]
+  ],
+  "write": " For a new file omit expected_sha256. Before replacing a file, read it and use its sha256."
 }

@@ -113,6 +113,7 @@ async fn read_only_tools_run_without_approval_and_turns_complete() {
             let replies = vec![
                 runtime::assistant("", vec![call("c1", "file_read", json!({"path": "a.txt"}))]),
                 runtime::assistant("done", vec![]),
+                runtime::assistant("The content is content.", vec![]),
             ];
             let (fixture, seen) = start(json!({}), replies).await;
             std::fs::write(fixture.workspace.path().join("a.txt"), "content").unwrap();
@@ -191,6 +192,49 @@ async fn read_only_tools_run_without_approval_and_turns_complete() {
                     .contains("content"),
                 "{completed}"
             );
+            for method in [
+                "session.rename",
+                "session.close",
+                "session.resume",
+                "session.export",
+            ] {
+                let frames = request(
+                    &fixture.socket,
+                    json!({"method": method, "session_id": id, "title": "Notes"}),
+                )
+                .await;
+                assert_eq!(frames[0]["ok"], true, "{frames:?}");
+                if method == "session.export" {
+                    assert_eq!(frames[0]["result"]["title"], "Notes");
+                }
+            }
+            let deleted = request(
+                &fixture.socket,
+                json!({"method": "session.delete", "session_id": id}),
+            )
+            .await;
+            assert_eq!(deleted[0]["result"]["deleted"], true);
+            let reopened = request(
+                &fixture.socket,
+                json!({"method": "session.resume", "session_id": id}),
+            )
+            .await;
+            assert_eq!(reopened[0]["ok"], false);
+
+            let local = session_with_model(&fixture, "qwen3.5-0.8b").await;
+            let frames = request(
+                &fixture.socket,
+                json!({"method": "turn.start", "session_id": local, "prompt": "Read a.txt. What is inside?"}),
+            ).await;
+            assert!(frames.iter().any(|f| {
+                f["event"]["type"] == "tool.completed" && f["event"]["status"] == "completed"
+            }));
+            let seen = seen.borrow();
+            assert_eq!(seen.len(), 3);
+            assert!(seen[2].get("tools").is_none());
+            let excerpt = seen[2]["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str().unwrap();
+            assert!(excerpt.ends_with("\n\ncontent"));
         })
         .await;
 }
@@ -300,7 +344,7 @@ async fn screenshot_access_is_explicit_and_reviewed_in_the_current_session() {
     tokio::task::LocalSet::new()
         .run_until(async {
             let shot = || runtime::assistant("", vec![call("shot", "screenshot", json!({"target": "screen"}))]);
-            let (fixture, seen) = start(json!({}), vec![runtime::assistant("done", vec![]), shot(), runtime::assistant("done", vec![]), shot()]).await;
+            let (fixture, seen) = start(json!({}), vec![runtime::assistant("done", vec![]), shot(), runtime::assistant("done", vec![])]).await;
             let text_session = session_with_model(&fixture, "minicpm5-1b").await;
             let id = session_with_model(&fixture, "lfm3-vl-2b").await;
             let turn = |id: &str, mode, prompt| json!({"method":"turn.start", "session_id":id, "screenshots":mode, "prompt":prompt});
@@ -311,6 +355,12 @@ async fn screenshot_access_is_explicit_and_reviewed_in_the_current_session() {
             let advertised = |index: usize| seen.borrow()[index]["tools"].as_array()
                 .is_some_and(|tools| tools.iter().any(|tool| tool["function"]["name"] == "screenshot"));
             assert!(!advertised(0));
+            assert!(seen.borrow()[0]["tools"].as_array().unwrap().iter().all(|tool| tool["function"]["name"] != "file_write"));
+            let off = request(&fixture.socket, turn(&id, "off", "take a screenshot")).await;
+            assert_eq!(off.last().unwrap()["error"], crate::screenshot::ACCESS_OFF);
+            let no_vision = request(&fixture.socket, turn(&text_session, "vision", "take a screenshot")).await;
+            assert_eq!(no_vision.last().unwrap()["error"], crate::screenshot::VISION_REQUIRED);
+            assert_eq!(seen.borrow().len(), 1);
             let frames = request(&fixture.socket, turn(&id, "off", "look")).await;
             assert_eq!(frames.last().unwrap()["turn_finished"], true);
             assert!(!advertised(1));
@@ -322,7 +372,7 @@ async fn screenshot_access_is_explicit_and_reviewed_in_the_current_session() {
             let live = tokio::task::spawn_local(async move { request(&socket, turn).await });
             let pending = tokio::time::timeout(Duration::from_secs(3), approval_requested(&fixture, &id)).await.unwrap();
             assert_eq!(pending["tool"], "screenshot");
-            assert!(advertised(3));
+            assert_eq!(seen.borrow().len(), 3);
             let revoke = request(&fixture.socket, json!({"method":"session.set_screenshots", "session_id":id, "screenshots":"off"})).await;
             assert_eq!(revoke[0]["ok"], false);
             request(&fixture.socket, json!({"method":"turn.cancel", "session_id":id})).await;
@@ -658,7 +708,10 @@ async fn turn_failures_expose_only_actionable_provider_errors() {
                     json!({"method": "turn.start", "session_id": id, "prompt": "hello"}),
                 )
                 .await;
-                assert_eq!(frames.last(), Some(&json!({"ok": false, "error": expected})));
+                assert_eq!(
+                    frames.last(),
+                    Some(&json!({"ok": false, "error": expected}))
+                );
                 assert!(frames.iter().any(|frame| {
                     frame["event"]["type"] == "turn.completed"
                         && frame["event"]["status"] == "failed"

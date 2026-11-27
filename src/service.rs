@@ -328,6 +328,10 @@ impl Service {
     fn save(&self, session: &Session) -> Result<()> {
         let body = json!({"schema_version": 1, "id": session.id, "workspace": session.workspace.path, "provider": session.provider, "model": session.model,
             "approval_mode": session.approval_mode.saved(), "title": session.title, "messages": session.messages, "last_turn_revision": session.last_turn_revision, "last_sequence": session.sequence, "profile": session.profile});
+        self.write_saved(&session.id, &body)
+    }
+
+    fn write_saved(&self, id: &str, body: &Value) -> Result<()> {
         let raw = body.to_string();
         if raw.len() > 2 * MAX_FRAME {
             return fail("session state exceeds limit");
@@ -342,7 +346,7 @@ impl Service {
                 .open(&temporary)?;
             file.write_all(raw.as_bytes())?;
             file.sync_all()?;
-            std::fs::rename(&temporary, self.state.join(format!("{}.json", session.id)))
+            std::fs::rename(&temporary, self.state.join(format!("{id}.json")))
         })();
         let _ = std::fs::remove_file(&temporary);
         result.map_err(|_| ToolError("session state unavailable".into()))
@@ -639,14 +643,42 @@ impl Service {
                 body["title"] = json!(saved_title(&body).or(title));
                 return Ok(body);
             }
+            "session.rename" => {
+                let id = session_id(&request["session_id"])?;
+                if self.busy.borrow().contains(&id) {
+                    return fail("stop the turn before renaming the chat");
+                }
+                let title = Self::text(request, "title")?.trim();
+                if title.is_empty()
+                    || title.chars().count() > 60
+                    || title.chars().any(char::is_control)
+                {
+                    return fail("invalid chat title");
+                }
+                let sessions = self.sessions.borrow();
+                if let Some(session) = sessions.get(&id) {
+                    let mut session = session.borrow_mut();
+                    let previous = session.title.replace(title.to_owned());
+                    if let Err(error) = self.save(&session) {
+                        session.title = previous;
+                        return Err(error);
+                    }
+                } else {
+                    let mut body = self.stored(&json!(id))?;
+                    body["title"] = json!(title);
+                    self.write_saved(&id, &body)?;
+                }
+                return Ok(json!({"title": title}));
+            }
             "session.delete" => {
                 let id = session_id(&request["session_id"])?;
-                if self.sessions.borrow().contains_key(&id) {
-                    return fail("close session before deleting its history");
+                if self.busy.borrow().contains(&id) {
+                    return fail("stop the turn before deleting its history");
                 }
                 self.stored(&json!(id))?;
                 std::fs::remove_file(self.state.join(format!("{id}.json")))
                     .map_err(|_| ToolError("session state unavailable".into()))?;
+                self.sessions.borrow_mut().remove(&id);
                 return Ok(json!({"deleted": true}));
             }
             "skills.list" => return self.skills.discover(),
@@ -761,6 +793,39 @@ impl Service {
             }
             _ => fail("unsupported service operation"),
         }
+    }
+
+    async fn warmup(&self, request: &Value) -> Result<Value> {
+        let (provider, model) =
+            if let Some(id) = request.get("session_id").filter(|id| !id.is_null()) {
+                let id = session_id(id)?;
+                let saved = self.stored(&json!(id))?;
+                (saved["provider"].clone(), saved["model"].clone())
+            } else {
+                (
+                    self.config
+                        .get("default_provider")
+                        .cloned()
+                        .unwrap_or(json!("local")),
+                    self.config["enzui"]["model"].clone(),
+                )
+            };
+        if provider != "local" || self.active.get() != 0 {
+            return Ok(json!({"warmed": false}));
+        }
+        let Some(gateway) = &self.gateway else {
+            return Ok(json!({"warmed": false}));
+        };
+        let model = match model.as_str().filter(|name| !name.is_empty()) {
+            Some(name) => name.to_owned(),
+            None => crate::local::pick_model(
+                &gateway.local_models().await?,
+                crate::local::Task::Text,
+                false,
+            )
+            .ok_or_else(|| ToolError(crate::provider::LOCAL_MODELS_UNAVAILABLE.into()))?,
+        };
+        gateway.warmup(&model).await
     }
 
     async fn send(writer: &mut OwnedWriteHalf, body: &Value) -> Result<()> {
@@ -889,6 +954,10 @@ impl Service {
                         )
                     };
                     let has_images = crate::attachment::has_images(&attachments);
+                    let screen_request = crate::local::Task::asks_for_screenshot(&prompt);
+                    if screen_request && screenshots == Access::Off {
+                        return fail(crate::screenshot::ACCESS_OFF);
+                    }
                     let model = if automatic {
                         let gateway = service.gateway.as_ref().ok_or_else(|| {
                             ToolError(crate::provider::LOCAL_MODELS_UNAVAILABLE.into())
@@ -896,7 +965,7 @@ impl Service {
                         crate::local::pick_model(
                             &gateway.local_models().await?,
                             task,
-                            has_images || screenshots != Access::Off,
+                            has_images || (screen_request && screenshots == Access::Vision),
                         )
                         .ok_or_else(|| {
                             ToolError(crate::provider::LOCAL_MODELS_UNAVAILABLE.into())
@@ -913,6 +982,17 @@ impl Service {
                         && model != crate::local::Profile::VISION_MODEL
                     {
                         return fail(crate::attachment::VISION_REQUIRED);
+                    }
+                    if screen_request
+                        && screenshots == Access::Vision
+                        && (automatic
+                            || crate::local::Profile::is_builtin(
+                                &session.borrow().provider,
+                                &model,
+                            ))
+                        && model != crate::local::Profile::VISION_MODEL
+                    {
+                        return fail(crate::screenshot::VISION_REQUIRED);
                     }
                     runtime::run_configured(
                         &session,
@@ -1086,6 +1166,14 @@ impl Service {
                 Self::send(&mut writer, &json!({"ok":true, "generation":generation})).await?;
                 desktop::exchange(session, generation, reader, &mut writer, peer, commands).await;
                 Ok(())
+            } else if request["method"] == "model.warmup" {
+                let result = tokio::select! {
+                    _ = reader.read_u8() => return Ok(()),
+                    result = tokio::time::timeout(Duration::from_secs(45), self.warmup(&request)) => {
+                        result.map_err(|_| ToolError(crate::provider::PROVIDER_TIMEOUT.into()))??
+                    }
+                };
+                Self::send(&mut writer, &json!({"ok": true, "result": result})).await
             } else if matches!(
                 request["method"].as_str(),
                 Some("turn.start" | "turn.revise")
@@ -1107,6 +1195,8 @@ impl Service {
                 | GATEWAY_UNAVAILABLE
                 | LOCAL_MODELS_UNAVAILABLE
                 | PROVIDER_TIMEOUT
+                | crate::screenshot::ACCESS_OFF
+                | crate::screenshot::VISION_REQUIRED
                 | crate::attachment::INVALID
                 | crate::attachment::VISION_REQUIRED
                 | "local-context-limit"

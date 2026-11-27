@@ -341,6 +341,26 @@ impl Gateway {
             .map_err(|_| ToolError(PROVIDER_TIMEOUT.into()))?
     }
 
+    pub(crate) async fn warmup(&self, model: &str) -> Result<Value> {
+        let (reader, mut writer) = self.connect().await?.into_split();
+        let body = json!({"provider": "local", "model": model}).to_string();
+        let request = format!(
+            "POST /v1/models/warmup HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        writer
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|_| ToolError(GATEWAY_UNAVAILABLE.into()))?;
+        let mut reader = BufReader::new(reader);
+        let (status, headers) = read_head(&mut reader).await?;
+        if status != 200 {
+            return fail(LOCAL_MODELS_UNAVAILABLE);
+        }
+        let data = read_body(&mut reader, &headers, 4096).await?;
+        serde_json::from_slice(&data).map_err(|_| ToolError("invalid warm-up response".into()))
+    }
+
     /// Request one completion and forward any streamed text to `delta`.
     pub async fn complete(&self, body: Value, delta: Delta) -> Result<Value> {
         let has_image = body["messages"]

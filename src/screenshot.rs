@@ -23,9 +23,13 @@ static CAPTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_PIXELS: u64 = 20_000_000;
 const MAX_IMAGE_BYTES: usize = 600 * 1024;
-pub(crate) const UNAVAILABLE: &str = "screenshot portal unavailable or capture declined";
-pub(crate) const UNSUPPORTED: &str =
-    "focused-window capture is unavailable; request a screen screenshot";
+pub(crate) const ACCESS_OFF: &str = "screenshot-access-off";
+pub(crate) const VISION_REQUIRED: &str = "screenshot-vision-required";
+pub(crate) const PORTAL_UNAVAILABLE: &str = "The desktop screenshot service is unavailable. Open Assistant from the enzimOS desktop session, or attach a screenshot you captured manually.";
+pub(crate) const DECLINED: &str = "Screen capture was declined or dismissed. Ask again if you want to grant permission, or attach an image.";
+pub(crate) const UNAVAILABLE: &str =
+    "The desktop returned no usable screenshot. Check the Assistant’s screenshot permission in Settings, or attach an image.";
+pub(crate) const UNSUPPORTED: &str = "The desktop does not support capturing the focused window. Ask the user to request a whole-screen screenshot or attach a window image.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Access {
@@ -105,7 +109,18 @@ pub(crate) async fn capture(access: Access, target: &str) -> Result<Capture> {
 }
 
 async fn screenshot_uri(target: &str) -> Result<String> {
-    let connection = Connection::session().await.map_err(|_| unavailable())?;
+    let portal_error = || ToolError(PORTAL_UNAVAILABLE.into());
+    let connection = Connection::session().await.map_err(|_| portal_error())?;
+    // Registration scopes portal permissions to Assistant when its desktop entry is installed.
+    let _ = connection
+        .call_method(
+            Some(PORTAL),
+            PATH,
+            Some("org.freedesktop.host.portal.Registry"),
+            "Register",
+            &("dev.enzui.Assistant", HashMap::<&str, Variant<'_>>::new()),
+        )
+        .await;
     let screenshot = Proxy::new(
         &connection,
         PORTAL,
@@ -113,7 +128,11 @@ async fn screenshot_uri(target: &str) -> Result<String> {
         "org.freedesktop.portal.Screenshot",
     )
     .await
-    .map_err(|_| unavailable())?;
+    .map_err(|_| portal_error())?;
+    screenshot
+        .get_property::<u32>("version")
+        .await
+        .map_err(|_| portal_error())?;
     let token = runtime::token();
     if token.is_empty() {
         return fail(UNAVAILABLE);
@@ -157,13 +176,16 @@ async fn screenshot_uri(target: &str) -> Result<String> {
     let returned: OwnedObjectPath = screenshot
         .call("Screenshot", &("", options))
         .await
-        .map_err(|_| unavailable())?;
+        .map_err(|_| portal_error())?;
     if returned.as_str() != request_path {
         return fail(UNAVAILABLE);
     }
     let response = response.next().await.ok_or_else(unavailable)?;
     let (code, mut values): (u32, HashMap<String, OwnedValue>) =
         response.body().deserialize().map_err(|_| unavailable())?;
+    if code == 1 {
+        return fail(DECLINED);
+    }
     if code != 0 {
         return fail(UNAVAILABLE);
     }
