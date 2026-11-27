@@ -18,6 +18,8 @@ pub(crate) const NO_BACKLIGHT: &str = "No controllable screen backlight was foun
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tool {
     Setting,
+    Preference(&'static str),
+    ReadSetting(&'static str),
     Open,
     Timer,
     Status,
@@ -27,7 +29,8 @@ pub(crate) enum Tool {
 impl Tool {
     pub(crate) fn name(self) -> &'static str {
         match self {
-            Self::Setting => "desktop_setting",
+            Self::Setting | Self::Preference(_) => "desktop_setting",
+            Self::ReadSetting(_) => "desktop_read_setting",
             Self::Open => "desktop_open",
             Self::Timer => "desktop_timer",
             Self::Status => "device_status",
@@ -36,7 +39,21 @@ impl Tool {
     }
 
     pub(crate) fn changes_state(self) -> bool {
-        matches!(self, Self::Setting | Self::Open | Self::Timer)
+        matches!(
+            self,
+            Self::Setting | Self::Preference(_) | Self::Open | Self::Timer
+        )
+    }
+
+    pub(crate) fn accepts_setting(self, setting: &Value) -> bool {
+        match self {
+            Self::Setting => matches!(
+                setting.as_str(),
+                Some("dark_mode" | "dnd" | "brightness" | "volume")
+            ),
+            Self::Preference(target) | Self::ReadSetting(target) => setting == target,
+            _ => true,
+        }
     }
 
     pub(crate) fn schema(self) -> Value {
@@ -45,6 +62,24 @@ impl Tool {
                 "Change a desktop setting. Use on/off for dark mode or Do Not Disturb. Use a percent (e.g. 40) or up/down for brightness or volume. Volume also accepts mute/unmute.",
                 json!({"setting":{"enum":["dark_mode","dnd","brightness","volume"]},"value":{"type":"string"}}),
                 json!(["setting", "value"]),
+            ),
+            Self::Preference(setting) => (
+                match setting {
+                    "night_light" | "notification_previews" => "Use on or off.",
+                    "shell_style" => "Use frame or islands.",
+                    "wallpaper" => "Use default or a #RRGGBB color.",
+                    "power_mode" => "Use power-saver, balanced, or performance.",
+                    "keyboard_layout" => "Use comma-separated XKB layout codes such as us,es.",
+                    "display_scale" => "Use output=scale, e.g. eDP-1=1.5 for 150%.",
+                    _ => "Use the app name or its .desktop ID.",
+                },
+                json!({"setting":{"enum":[setting]},"value":{"type":"string"}}),
+                json!(["setting", "value"]),
+            ),
+            Self::ReadSetting(setting) => (
+                "Read the current desktop setting.",
+                json!({"setting":{"enum":[setting]}}),
+                json!(["setting"]),
             ),
             Self::Open => (
                 "Open an installed app by name. To open a folder, set app to Files and folder to a user folder name or absolute path.",
@@ -116,8 +151,27 @@ impl Tool {
                     | "növeld"
             )
         );
-        if change && setting_target(&words).is_some() {
-            return Some(Self::Setting);
+        if let Some(setting) = preference_target(&words) {
+            if change {
+                return Some(Self::Preference(setting));
+            }
+            if matches!(
+                first,
+                Some("what" | "which" | "check" | "show" | "tell" | "is" | "get")
+            ) || words.windows(2).any(|pair| pair == ["how", "is"])
+            {
+                return Some(Self::ReadSetting(setting));
+            }
+        }
+        if let Some((setting, _)) = setting_target(&words) {
+            if change {
+                return Some(Self::Setting);
+            }
+            if matches!(setting, "dark_mode" | "dnd")
+                && matches!(first, Some("what" | "check" | "show" | "tell" | "is"))
+            {
+                return Some(Self::ReadSetting(setting));
+            }
         }
         if (change || matches!(first, Some("start" | "begin" | "inicia" | "indíts")))
             && any(&["timer", "countdown", "temporizador", "időzítő", "időzítőt"])
@@ -218,6 +272,8 @@ impl Tool {
         };
         match self {
             Self::Setting if !negative_number() => setting_arguments(&words),
+            Self::ReadSetting(setting) => Some(json!({"setting":setting})),
+            Self::Preference(setting) => preference_arguments(setting, &words),
             Self::Status => Some(json!({"metric": Self::metric(&words)?})),
             Self::Timer if !negative_number() => timer_arguments(&words),
             Self::Downloads => download_arguments(&words, &lower),
@@ -248,6 +304,61 @@ impl Tool {
         let (metric, _) = found.next()?;
         found.next().is_none().then_some(*metric)
     }
+}
+
+fn preference_target(words: &[&str]) -> Option<&'static str> {
+    let has = |word| words.contains(&word);
+    let mut settings = [
+        (has("night") && has("light"), "night_light"),
+        (has("wallpaper"), "wallpaper"),
+        (
+            (has("shell") || has("desktop")) && has("style"),
+            "shell_style",
+        ),
+        (
+            has("power") && (has("mode") || has("profile")),
+            "power_mode",
+        ),
+        (
+            (has("display") || has("screen")) && (has("scale") || has("scaling")),
+            "display_scale",
+        ),
+        (has("keyboard") && has("layout"), "keyboard_layout"),
+        (
+            has("notification") && (has("previews") || has("images")),
+            "notification_previews",
+        ),
+        (has("default") && has("browser"), "default_browser"),
+        (
+            has("default") && (has("mail") || has("email")),
+            "default_mail",
+        ),
+        (has("default") && has("files"), "default_files"),
+    ]
+    .into_iter()
+    .filter_map(|(mentioned, setting)| mentioned.then_some(setting));
+    let setting = settings.next()?;
+    settings.next().is_none().then_some(setting)
+}
+
+fn preference_arguments(setting: &str, words: &[&str]) -> Option<Value> {
+    let has = |word| words.contains(&word);
+    let value = match setting {
+        "night_light" | "notification_previews" => {
+            match (has("on") || has("enable"), has("off") || has("disable")) {
+                (true, false) => "on",
+                (false, true) => "off",
+                _ => return None,
+            }
+        }
+        "shell_style" => match (has("islands"), has("frame")) {
+            (true, false) => "islands",
+            (false, true) => "frame",
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(json!({"setting":setting,"value":value}))
 }
 
 fn setting_target(words: &[&str]) -> Option<(&'static str, bool)> {

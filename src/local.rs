@@ -3,6 +3,8 @@ use crate::device;
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 
+pub(crate) const DESKTOP_CONTEXT: &str = "This computer runs enzimOS, an Arch Linux desktop. Install apps with the Store app or `flatpak install`, system packages with `sudo pacman -S`, and change options in the enzimOS Settings app. Use your tools first. Never give Windows or macOS steps or keys.";
+
 static PROFILES: LazyLock<Value> = LazyLock::new(|| {
     serde_json::from_str(include_str!("local_profiles.json"))
         .expect("built-in local profiles must be valid JSON")
@@ -339,7 +341,10 @@ impl Profile {
                 tune_sampling: false,
             });
         }
-        let mut instructions = format!("{}{model_prompt}", PROFILES["prompt"].as_str()?);
+        let mut instructions = format!(
+            "{DESKTOP_CONTEXT} {}{model_prompt}",
+            PROFILES["prompt"].as_str()?
+        );
         let tools = match task {
             Task::Text => {
                 if !desktop_available {
@@ -498,6 +503,17 @@ mod tests {
             (
                 "Please set a 12-minute countdown.",
                 Some(("desktop_timer", json!({"seconds":720}))),
+            ),
+            (
+                "Enable Night Light.",
+                Some((
+                    "desktop_setting",
+                    json!({"setting":"night_light","value":"on"}),
+                )),
+            ),
+            (
+                "What is my current keyboard layout?",
+                Some(("desktop_read_setting", json!({"setting":"keyboard_layout"}))),
             ),
             ("Set a 1.5 minute timer.", None),
             ("Set a -10 second timer.", None),

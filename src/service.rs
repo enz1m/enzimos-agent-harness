@@ -919,7 +919,10 @@ impl Service {
                         .as_array()
                         .filter(|s| s.len() <= 8)
                         .ok_or_else(|| ToolError("skill selection limit exceeded".into()))?;
-                    let mut instructions = vec![BASE_INSTRUCTIONS.to_owned()];
+                    let mut instructions = vec![format!(
+                        "{} {BASE_INSTRUCTIONS}",
+                        crate::local::DESKTOP_CONTEXT
+                    )];
                     for choice in selected {
                         let valid = choice.as_object().is_some_and(|c| {
                             c.len() == 2 && c.contains_key("name") && c.contains_key("sha256")

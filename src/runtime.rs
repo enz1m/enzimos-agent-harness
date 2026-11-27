@@ -553,6 +553,9 @@ async fn invoke(
     }
     let device_tool = device_tool.filter(|tool| tool.name() == name);
     if let Some(tool) = device_tool {
+        if !tool.accepts_setting(arguments.get("setting").unwrap_or(&Value::Null)) {
+            return fail("invalid desktop setting");
+        }
         schemas.push(tool.schema());
     }
     let builtin = schemas
@@ -1322,12 +1325,12 @@ mod transcript_tests {
         let request = invoke(
             &chat,
             "set",
-            device::Tool::Setting.name(),
-            json!({"setting":"dark_mode","value":"on"}),
+            device::Tool::Preference("night_light").name(),
+            json!({"setting":"night_light","value":"on"}),
             None,
             &mut visual,
             "fixture",
-            (None, Some(device::Tool::Setting)),
+            (None, Some(device::Tool::Preference("night_light"))),
         );
         tokio::pin!(request);
         std::future::poll_fn(|cx| {
