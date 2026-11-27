@@ -142,6 +142,8 @@ async fn read_only_tools_run_without_approval_and_turns_complete() {
                     "turn.completed"
                 ]
             );
+            assert_eq!(seen.borrow()[0]["conversation_id"], id);
+            assert_eq!(seen.borrow()[1]["conversation_id"], id);
             let tool_message = seen.borrow()[1]["messages"]
                 .as_array()
                 .unwrap()

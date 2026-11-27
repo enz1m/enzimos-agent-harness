@@ -1379,11 +1379,11 @@ pub(crate) async fn run_configured(
             if local.is_none() || !tools.is_empty() {
                 request["tools"] = json!(tools);
             }
-            if let Some(profile) = &local {
+            if provider == "local" {
                 request["conversation_id"] = json!(session.borrow().id);
-                if profile.tune_sampling {
-                    Profile::sample(&mut request);
-                }
+            }
+            if local.as_ref().is_some_and(|profile| profile.tune_sampling) {
+                Profile::sample(&mut request);
             }
             let direct = direct
                 .filter(|(name, _)| tools.iter().any(|tool| tool["function"]["name"] == *name));
