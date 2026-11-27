@@ -107,11 +107,19 @@ pub(crate) async fn invoke(
 pub(crate) struct ShellPeer(OwnedFd);
 
 impl ShellPeer {
+    pub(crate) fn new(socket: &UnixStream) -> Option<Self> {
+        Self::verify(socket, false)
+    }
+
+    pub(crate) fn assistant(socket: &UnixStream) -> Option<Self> {
+        Self::verify(socket, true)
+    }
+
     #[allow(
         unsafe_code,
         reason = "Pin the socket's original Linux peer across process identity checks."
     )]
-    pub(crate) fn new(socket: &UnixStream) -> Option<Self> {
+    fn verify(socket: &UnixStream, assistant: bool) -> Option<Self> {
         let credentials = socket.peer_cred().ok()?;
         if credentials.uid() != uid() {
             return None;
@@ -141,9 +149,15 @@ impl ShellPeer {
         );
         let proc = PathBuf::from(format!("/proc/{pid}"));
         let running = fs::metadata(proc.join("exe")).ok()?;
-        let trusted = fs::metadata(expected).ok()?;
+        let trusted = fs::metadata(&expected).ok()?;
+        let matches = |expected: &fs::Metadata| {
+            (running.dev(), running.ino()) == (expected.dev(), expected.ino())
+        };
+        let assistant_matches = assistant
+            && fs::metadata(expected.with_file_name("enzui-assistant"))
+                .is_ok_and(|metadata| matches(&metadata));
         (running.is_file()
-            && (running.dev(), running.ino()) == (trusted.dev(), trusted.ino())
+            && (matches(&trusted) || assistant_matches)
             && clean_environment(&proc, preview.is_some())
             && peer.alive())
         .then_some(peer)
@@ -153,7 +167,7 @@ impl ShellPeer {
         unsafe_code,
         reason = "Linux exposes peer exit readiness on the pidfd."
     )]
-    fn alive(&self) -> bool {
+    pub(crate) fn alive(&self) -> bool {
         let mut fd = libc::pollfd {
             fd: self.0.as_raw_fd(),
             events: libc::POLLIN,

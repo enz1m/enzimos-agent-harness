@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+use crate::device;
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 
@@ -14,6 +15,7 @@ pub(crate) enum Task {
     Write,
     Rename,
     Screen,
+    Device(device::Tool),
     Full,
 }
 
@@ -53,6 +55,61 @@ fn rename_paths(prompt: &str) -> Option<(&str, &str)> {
     .then_some((path, name))
 }
 
+fn open_arguments(prompt: &str) -> Option<Value> {
+    let (verb, rest) = rename_operand(prompt)?;
+    let (verb, rest) = if verb.eq_ignore_ascii_case("please") {
+        rename_operand(rest)?
+    } else {
+        (verb, rest)
+    };
+    if !verb.eq_ignore_ascii_case("open") {
+        return None;
+    }
+    let (app, tail) = rename_operand(rest)?;
+    let (preposition, folder) = rename_operand(tail)?;
+    if app.eq_ignore_ascii_case("files")
+        && ["in", "at", "to"]
+            .iter()
+            .any(|word| preposition.eq_ignore_ascii_case(word))
+    {
+        let folder = folder.trim();
+        let folder = if folder.starts_with(['"', '\'', '`']) {
+            let (folder, tail) = rename_operand(folder)?;
+            if !tail.trim().chars().all(|ch| matches!(ch, '.' | '!' | '?')) {
+                return None;
+            }
+            folder
+        } else {
+            folder.trim_end_matches(['.', '!', '?'])
+        };
+        return (!folder.is_empty() && !folder.chars().any(char::is_control))
+            .then(|| json!({"app":"Files","folder":folder}));
+    }
+
+    let app = rest
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .trim_matches(['"', '\'', '`']);
+    let lower = app.to_lowercase();
+    if app.is_empty()
+        || app.len() > 120
+        || app.chars().any(char::is_control)
+        || lower.split_whitespace().any(|word| {
+            matches!(
+                word,
+                "and" | "in" | "at" | "to" | "with" | "folder" | "the" | "app"
+            )
+        })
+        || matches!(
+            lower.as_str(),
+            "downloads" | "documents" | "home" | "pictures" | "music" | "videos"
+        )
+    {
+        return None;
+    }
+    Some(json!({"app":app}))
+}
+
 impl Task {
     pub(crate) fn asks_for_screenshot(prompt: &str) -> bool {
         let instruction = prompt
@@ -86,6 +143,14 @@ impl Task {
 
     pub(crate) fn direct_tool(self, prompt: &str) -> Option<(&'static str, Value)> {
         match self {
+            Self::Device(tool) => {
+                let arguments = if tool == device::Tool::Open {
+                    open_arguments(prompt)?
+                } else {
+                    tool.grounded_arguments(prompt)?
+                };
+                Some((tool.name(), arguments))
+            }
             Self::Screen => {
                 let window = prompt
                     .split(|ch: char| !ch.is_alphanumeric())
@@ -148,6 +213,9 @@ impl Task {
                     .any(|word| words.contains(word)))
         {
             return Self::Full;
+        }
+        if let Some(tool) = device::Tool::classify(&words, first_action.copied()) {
+            return Self::Device(tool);
         }
         let file = words.iter().any(|word| {
             let word = word.trim_end_matches('.');
@@ -279,6 +347,10 @@ impl Profile {
                 }
                 Vec::new()
             }
+            Task::Device(_) => {
+                instructions.push_str("\nUse the desktop tool for the request. Answer from its result in the user's language.");
+                Vec::new()
+            }
             Task::Screen => full_tools
                 .iter()
                 .filter(|tool| tool["function"]["name"] == "screenshot")
@@ -338,7 +410,7 @@ pub(crate) fn pick_model(catalog: &Value, task: Task, prefer_vision: bool) -> Op
         return Some(Profile::VISION_MODEL.to_owned());
     }
     let id = |entry: &Value| entry["id"].as_str().map(str::to_owned);
-    let workspace = if matches!(task, Task::Text | Task::Screen) {
+    let workspace = if matches!(task, Task::Text | Task::Screen | Task::Device(_)) {
         None
     } else {
         [Profile::VISION_MODEL, "qwen3.5-0.8b", "minicpm5-1b"]
@@ -414,8 +486,77 @@ mod tests {
     }
 
     #[test]
+    fn desktop_routing_preserves_explicit_arguments_and_leaves_ambiguous_requests_to_the_model() {
+        let cases = [
+            (
+                "Can you make the monitor dimmer?",
+                Some((
+                    "desktop_setting",
+                    json!({"setting":"brightness","value":"down"}),
+                )),
+            ),
+            (
+                "Please set a 12-minute countdown.",
+                Some(("desktop_timer", json!({"seconds":720}))),
+            ),
+            ("Set a 1.5 minute timer.", None),
+            ("Set a -10 second timer.", None),
+            (
+                "Locate the zip downloaded yesterday.",
+                Some((
+                    "find_downloads",
+                    json!({"date":"yesterday","extension":"zip"}),
+                )),
+            ),
+            (
+                "List the PDF downloads from 2026-02-05.",
+                Some((
+                    "find_downloads",
+                    json!({"date":"2026-02-05","extension":"pdf"}),
+                )),
+            ),
+        ];
+        for (prompt, expected) in cases {
+            assert_eq!(
+                Task::classify(prompt, false).direct_tool(prompt),
+                expected,
+                "{prompt}"
+            );
+        }
+    }
+
+    #[test]
     fn workspace_evidence_selects_file_tools_independently_of_language() {
         assert!(Task::classify("What is the capital of France?", false) == Task::Text);
+        assert!(Task::classify("How does CPU scheduling work?", false) == Task::Text);
+        assert_eq!(
+            Task::Device(device::Tool::Open)
+                .direct_tool("Please open Files at \"/tmp/Project files.\""),
+            Some((
+                "desktop_open",
+                json!({"app":"Files","folder":"/tmp/Project files."})
+            ))
+        );
+        assert_eq!(
+            Task::Device(device::Tool::Open).direct_tool("Open Calculator."),
+            Some(("desktop_open", json!({"app":"Calculator"})))
+        );
+        assert!(Task::classify("What is a battery?", false) == Task::Text);
+        assert!(
+            Task::classify("How much RAM is this computer using?", false)
+                == Task::Device(device::Tool::Status)
+        );
+        for request in [
+            "Please lower the volume",
+            "Enable dark mode.",
+            "Activa el modo oscuro.",
+        ] {
+            assert!(Task::classify(request, false) == Task::Device(device::Tool::Setting));
+        }
+        assert!(
+            Task::classify("Locate the ZIP I downloaded yesterday", false)
+                == Task::Device(device::Tool::Downloads)
+        );
         assert!(Task::classify("Read todo.txt", false) == Task::Files);
         assert!(Task::classify("Mi van ebben a mappában?", false) == Task::Files);
         assert!(Task::classify("olvasd el a todo.txt fájlt", false) == Task::Files);

@@ -4,6 +4,7 @@
 //! shell owns presentation.
 mod attachment;
 mod desktop;
+mod device;
 pub mod http_mcp;
 mod local;
 pub mod mcp;

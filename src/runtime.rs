@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Sessions, exact expiring tool approvals and a provider-independent bounded tool loop.
 use crate::{
-    Result, ToolError, desktop, fail,
+    Result, ToolError, desktop, device, fail,
     local::{Profile, Task},
     mcp::Mcp,
     screenshot::{self, Access},
@@ -105,6 +105,12 @@ const CORRECTABLE: &[(&str, &str)] = &[
     ),
     (desktop::UNAVAILABLE, desktop::UNAVAILABLE),
     (desktop::INVALID, desktop::INVALID),
+    (device::LOCKED, device::LOCKED),
+    (device::UNAVAILABLE, device::UNAVAILABLE),
+    (device::TIMER_LIMIT, device::TIMER_LIMIT),
+    (device::APP_UNAVAILABLE, device::APP_UNAVAILABLE),
+    (device::FOLDER_UNAVAILABLE, device::FOLDER_UNAVAILABLE),
+    (device::NO_BACKLIGHT, device::NO_BACKLIGHT),
     (screenshot::UNAVAILABLE, screenshot::UNAVAILABLE),
     (screenshot::UNSUPPORTED, screenshot::UNSUPPORTED),
     (
@@ -252,6 +258,7 @@ enum ApprovalDecision {
 }
 
 struct Pending {
+    desktop: bool,
     sender: Option<oneshot::Sender<ApprovalDecision>>,
     binding: String,
     turn_id: Option<String>,
@@ -268,6 +275,7 @@ pub struct Session {
     text_only_models: HashSet<String>,
     pub(crate) title: Option<String>,
     pub(crate) desktop: Option<desktop::Control>,
+    pub(crate) verified_desktop_turn: bool,
     allowed_tools: HashSet<String>,
     pub profile: String,
     pub workspace: Workspace,
@@ -307,6 +315,7 @@ impl Session {
             text_only_models: HashSet::new(),
             title: None,
             desktop: None,
+            verified_desktop_turn: false,
             allowed_tools: HashSet::new(),
             profile: profile.into(),
             workspace,
@@ -375,6 +384,12 @@ impl Session {
         !steers.is_empty()
     }
 
+    pub(crate) fn desktop_approval(&self, request_id: &str) -> bool {
+        self.pending
+            .get(request_id)
+            .is_some_and(|pending| pending.desktop)
+    }
+
     pub fn resolve(
         &mut self,
         request_id: &str,
@@ -394,6 +409,9 @@ impl Session {
             .get_mut(request_id)
             .filter(|p| p.binding == binding && p.turn_id == turn && p.expires > Instant::now())
             .ok_or_else(|| ToolError("stale or mismatched approval".into()))?;
+        if pending.desktop && matches!(decision, ApprovalDecision::Session) {
+            return fail("desktop actions require approval for the exact request");
+        }
         let sender = pending
             .sender
             .take()
@@ -468,6 +486,7 @@ async fn approval(
     name: &str,
     arguments: &Value,
     grant: &str,
+    desktop: bool,
 ) -> bool {
     let (sender, receiver) = oneshot::channel();
     let request_id = token();
@@ -479,13 +498,14 @@ async fn approval(
         s.pending.insert(
             request_id.clone(),
             Pending {
+                desktop,
                 sender: Some(sender),
                 binding: binding.clone(),
                 turn_id,
                 expires: Instant::now() + Duration::from_secs(90),
             },
         );
-        s.emit("approval.requested", json!({"request_id": request_id, "binding": binding, "call_id": call_id, "tool": name, "arguments": arguments}));
+        s.emit("approval.requested", json!({"request_id": request_id, "binding": binding, "call_id": call_id, "tool": name, "arguments": arguments, "once_only": desktop}));
     }
     let mut guard = ApprovalGuard {
         session: session.clone(),
@@ -513,7 +533,7 @@ async fn invoke(
     mcp: Option<&Mcp>,
     image: &mut Option<Value>,
     model: &str,
-    desktop_generation: Option<&str>,
+    (desktop_generation, device_tool): (Option<&str>, Option<device::Tool>),
 ) -> Result<Value> {
     let arguments = match arguments {
         Value::Object(map) if Value::Object(map.clone()).to_string().len() <= 128 * 1024 => map,
@@ -530,6 +550,10 @@ async fn invoke(
     let mut schemas = tools_schema(screenshots);
     if desktop_generation.is_some() {
         schemas.extend(desktop::schemas());
+    }
+    let device_tool = device_tool.filter(|tool| tool.name() == name);
+    if let Some(tool) = device_tool {
+        schemas.push(tool.schema());
     }
     let builtin = schemas
         .iter()
@@ -556,10 +580,15 @@ async fn invoke(
     };
     let arguments_value = Value::Object(arguments.clone());
     let desktop_tool = name.starts_with("computer_") && builtin.is_some();
-    let needs_approval = !desktop_tool
-        && session
-            .borrow()
-            .needs_approval(name, &arguments_value, &grant);
+    let needs_approval = device_tool.map_or_else(
+        || {
+            !desktop_tool
+                && session
+                    .borrow()
+                    .needs_approval(name, &arguments_value, &grant)
+        },
+        device::Tool::changes_state,
+    );
     let flag = |k: &str| arguments.get(k).and_then(Value::as_bool).unwrap_or(false);
     session.borrow_mut().emit(
         "tool.started",
@@ -567,8 +596,21 @@ async fn invoke(
     );
     let started = Instant::now();
     let outcome = async {
-        if needs_approval && !approval(session, call_id, name, &arguments_value, &grant).await {
+        if needs_approval
+            && !approval(
+                session,
+                call_id,
+                name,
+                &arguments_value,
+                &grant,
+                device_tool.is_some(),
+            )
+            .await
+        {
             return fail(ACTION_DECLINED);
+        }
+        if let Some(tool) = device_tool {
+            return device::invoke(tool, arguments_value.clone()).await;
         }
         let text = |k: &str| {
             arguments
@@ -696,6 +738,7 @@ impl Drop for TurnGuard {
             s.pending.clear();
             s.steers.clear();
             s.turn_id = None;
+            s.verified_desktop_turn = false;
             s.task = None;
         }
     }
@@ -722,6 +765,7 @@ pub async fn run(
             task: Task::Full,
             attachments: Vec::new(),
             replace: None,
+            verified_desktop: false,
         },
     )
     .await
@@ -777,6 +821,7 @@ pub(crate) struct TurnProfile<'a> {
     pub(crate) task: Task,
     pub(crate) attachments: Vec<Value>,
     pub(crate) replace: Option<usize>,
+    pub(crate) verified_desktop: bool,
 }
 
 pub(crate) async fn run_configured(
@@ -791,6 +836,7 @@ pub(crate) async fn run_configured(
         task,
         attachments,
         replace,
+        verified_desktop,
     }: TurnProfile<'_>,
 ) -> Result<()> {
     if session.borrow().turn_id.is_some() {
@@ -840,6 +886,7 @@ pub(crate) async fn run_configured(
         s.last_turn_revision = None;
         s.last_active = Instant::now();
         s.turn_id = Some(token());
+        s.verified_desktop_turn = verified_desktop;
         s.emit(
             "turn.started",
             json!({"model": model, "replacing": replace.is_some()}),
@@ -856,6 +903,7 @@ pub(crate) async fn run_configured(
         let mut seen = HashSet::new();
         let mut image: Option<Value> = None;
         let mut read_excerpt: Option<String> = None;
+        let mut used_device = false;
         for _ in 0..max_steps {
             let mut messages = {
                 let mut s = session.borrow_mut();
@@ -865,6 +913,7 @@ pub(crate) async fn run_configured(
                     && let Some(text) = steer["content"].as_str()
                 {
                     task = Task::from_turn(text, history);
+                    used_device = false;
                 }
                 trim(&mut s.messages, CONTEXT_LIMIT);
                 if size(&s.messages) > CONTEXT_LIMIT {
@@ -872,6 +921,11 @@ pub(crate) async fn run_configured(
                 }
                 s.messages.clone()
             };
+            let device_request = match task {
+                Task::Device(tool) if verified_desktop && device::available() => Some(tool),
+                _ => None,
+            };
+            let device_tool = device_request.filter(|_| !used_device);
             let direct = known_local
                 .then(|| {
                     messages
@@ -902,12 +956,18 @@ pub(crate) async fn run_configured(
                 .borrow()
                 .desktop
                 .as_ref()
-                .filter(|control| control.active && !control.commands.is_closed())
+                .filter(|control| {
+                    device_request.is_none() && control.active && !control.commands.is_closed()
+                })
                 .map(|control| control.generation.clone());
             let local = Profile::for_model(
                 &provider,
                 model,
-                if answer_read { Task::Text } else { task },
+                if answer_read || matches!(task, Task::Device(_)) && device_request.is_none() {
+                    Task::Text
+                } else {
+                    task
+                },
                 instructions.unwrap_or_default(),
                 &full_tools,
                 desktop_generation.is_some() && !answer_read,
@@ -920,6 +980,9 @@ pub(crate) async fn run_configured(
                 None => (instructions, full_tools.as_slice()),
             };
             let mut tools = profile_tools.to_vec();
+            if let Some(tool) = device_tool {
+                tools.push(tool.schema());
+            }
             if desktop_generation.is_some() && !answer_read {
                 tools.extend(desktop::schemas());
             }
@@ -1052,6 +1115,7 @@ pub(crate) async fn run_configured(
             }
             let mut used_desktop_tool = false;
             let mut guidance = None;
+            let mut device_answer = None;
             for (call, call_id) in calls.into_iter().zip(ids) {
                 let function = &call["function"];
                 let result = match (
@@ -1076,6 +1140,13 @@ pub(crate) async fn run_configured(
                         {
                             generation = None;
                         }
+                        if device_tool.is_some_and(|tool| tool.name() == name) {
+                            if used_device {
+                                guidance = Some("Only one desktop action is allowed per request.");
+                                break;
+                            }
+                            used_device = true;
+                        }
                         invoke(
                             session,
                             &call_id,
@@ -1084,7 +1155,7 @@ pub(crate) async fn run_configured(
                             mcp,
                             &mut image,
                             model,
-                            generation,
+                            (generation, device_tool),
                         )
                         .await
                     }
@@ -1111,6 +1182,12 @@ pub(crate) async fn run_configured(
                 {
                     guidance = Some(model_error(error));
                 }
+                if !declined
+                    && device_tool.is_some_and(|tool| function["name"] == tool.name())
+                    && let Err(error) = &result
+                {
+                    guidance = Some(model_error(error));
+                }
                 if direct_rename && !declined {
                     guidance = Some(match &result {
                         Ok(_) => "Renamed the workspace entry.",
@@ -1131,6 +1208,15 @@ pub(crate) async fn run_configured(
                             )
                         }
                     }
+                }
+                if let Ok(reading) = &result
+                    && let Some(tool) = device_tool.filter(|tool| function["name"] == tool.name())
+                {
+                    device_answer = match tool {
+                        device::Tool::Status => device::cpu_answer(reading),
+                        device::Tool::Downloads => device::download_answer(reading),
+                        _ => None,
+                    };
                 }
                 let mut content = match result {
                     Ok(result) => json!({"ok": true, "result": result}).to_string(),
@@ -1160,7 +1246,7 @@ pub(crate) async fn run_configured(
                     break;
                 }
             }
-            if let Some(guidance) = guidance {
+            if let Some(guidance) = device_answer.as_deref().or(guidance) {
                 let mut s = session.borrow_mut();
                 close_batch(&mut s.messages);
                 s.messages.push(assistant(guidance, vec![]));
@@ -1226,6 +1312,55 @@ mod transcript_tests {
     }
 
     #[tokio::test]
+    async fn a_structured_desktop_action_requires_exact_approval_even_in_full_send() {
+        let dir = tempfile::tempdir().expect("workspace fixture");
+        let chat = desktop_session(dir.path());
+        chat.borrow_mut()
+            .configure_mode(ApprovalMode::FullSend, true)
+            .expect("enable full send");
+        let mut visual = None;
+        let request = invoke(
+            &chat,
+            "set",
+            device::Tool::Setting.name(),
+            json!({"setting":"dark_mode","value":"on"}),
+            None,
+            &mut visual,
+            "fixture",
+            (None, Some(device::Tool::Setting)),
+        );
+        tokio::pin!(request);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(request.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        {
+            let mut state = chat.borrow_mut();
+            let event = state.events.back().expect("approval event");
+            assert_eq!(event["once_only"], true);
+            let id = event["request_id"]
+                .as_str()
+                .expect("approval ID")
+                .to_owned();
+            let binding = event["binding"]
+                .as_str()
+                .expect("approval binding")
+                .to_owned();
+            assert!(state.desktop_approval(&id));
+            assert!(
+                state
+                    .resolve(&id, &binding, &json!(true), Some(&json!(true)))
+                    .is_err()
+            );
+            state
+                .resolve(&id, &binding, &json!(false), None)
+                .expect("deny approval");
+        }
+        assert_eq!(request.await.unwrap_err().0, ACTION_DECLINED);
+    }
+
+    #[tokio::test]
     async fn desktop_capability_requires_activation_and_the_advertised_generation() {
         let dir = tempfile::tempdir().unwrap();
         let chat = desktop_session(dir.path());
@@ -1246,7 +1381,7 @@ mod transcript_tests {
                     None,
                     &mut None,
                     "fixture",
-                    Some(generation),
+                    (Some(generation), None),
                 )
                 .await
             }
@@ -1369,6 +1504,7 @@ mod transcript_tests {
                 task: Task::Write,
                 attachments: Vec::new(),
                 replace: None,
+                verified_desktop: false,
             },
         )
         .await

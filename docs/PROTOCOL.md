@@ -123,6 +123,15 @@ clears live grants. Wrong, stale and repeated bindings are rejected. Pending
 approvals expire in 90 seconds. Clients must show the actual action before approving.
 No automated permission acceptance is provided by the CLI.
 
+Structured desktop tools are available for relevant requests from the verified
+Shell or Assistant executable when the Shell broker is running. Device
+readings and download filename searches require no action approval. Setting
+changes, app or folder launches, and timers ask for approval on each call,
+including in Full send. The approval event sets `once_only` and only the
+verified desktop client may resolve it with `remember: false`. The broker also
+checks the harness executable and refuses requests while the desktop is locked.
+Desktop action tools do not enable pointer or keyboard control.
+
 Sessions are saved after turns. An abrupt crash can lose in-flight conversation;
 no successful tool action is automatically replayed during resume.
 

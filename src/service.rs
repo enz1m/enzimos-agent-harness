@@ -621,7 +621,7 @@ impl Service {
             .ok_or_else(|| ToolError("invalid request".into()))
     }
 
-    fn dispatch(&self, request: &Value) -> Result<Value> {
+    fn dispatch(&self, request: &Value, assistant: bool) -> Result<Value> {
         match request["method"].as_str().unwrap_or_default() {
             "session.create" => {
                 if self.saved_list()?.as_array().map_or(0, Vec::len) >= 128 {
@@ -768,8 +768,12 @@ impl Service {
                 Ok(json!({"screenshots": access.wire()}))
             }
             "approval.resolve" => {
+                let request_id = Self::text(request, "request_id")?;
+                if !assistant && session.borrow().desktop_approval(request_id) {
+                    return fail(desktop::UNAVAILABLE);
+                }
                 session.borrow_mut().resolve(
-                    Self::text(request, "request_id")?,
+                    request_id,
                     Self::text(request, "binding")?,
                     &request["allow"],
                     request.get("remember"),
@@ -777,6 +781,9 @@ impl Service {
                 Ok(json!({"resolved": true}))
             }
             "turn.steer" => {
+                if !assistant && session.borrow().verified_desktop_turn {
+                    return fail(desktop::UNAVAILABLE);
+                }
                 session.borrow_mut().steer(Self::text(request, "text")?)?;
                 Ok(json!({"steered": true}))
             }
@@ -838,6 +845,7 @@ impl Service {
         request: &Value,
         reader: &mut R,
         writer: &mut OwnedWriteHalf,
+        verified_desktop: bool,
     ) -> Result<()> {
         let id = request["session_id"]
             .as_str()
@@ -999,6 +1007,7 @@ impl Service {
                             task,
                             attachments,
                             replace,
+                            verified_desktop,
                         },
                     )
                     .await
@@ -1127,13 +1136,19 @@ impl Service {
             if !reader.buffer().is_empty() {
                 return fail("client sent excess request data");
             }
-            Ok((request, desktop))
+            let assistant = matches!(
+                request["method"].as_str(),
+                Some("turn.start" | "turn.revise" | "turn.steer" | "approval.resolve")
+            )
+            .then(|| desktop::ShellPeer::assistant(reader.get_ref()))
+            .flatten();
+            Ok((request, desktop, assistant))
         }
         .await;
         let (input, mut writer) = reader.into_inner().into_split();
         let mut reader = BufReader::with_capacity(65536, input);
         let result = async {
-            let (request, desktop) = result?;
+            let (request, desktop, assistant) = result?;
             if let Some((peer, id, generation)) = desktop {
                 let (session, commands) = {
                     let sessions = self.sessions.borrow();
@@ -1171,9 +1186,9 @@ impl Service {
                 request["method"].as_str(),
                 Some("turn.start" | "turn.revise")
             ) {
-                self.turn(&request, &mut reader, &mut writer).await
+                self.turn(&request, &mut reader, &mut writer, assistant.is_some()).await
             } else {
-                let result = self.dispatch(&request)?;
+                let result = self.dispatch(&request, assistant.is_some())?;
                 Self::send(&mut writer, &json!({"ok": true, "result": result})).await
             }
         }
