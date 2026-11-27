@@ -220,6 +220,12 @@ async fn writes_need_an_exact_unexpired_approval() {
             assert_eq!(ok[0]["result"]["resolved"], true);
             let frames = turn.await.unwrap();
             assert_eq!(frames.last().unwrap()["turn_finished"], true);
+            assert!(frames.iter().any(|frame| {
+                let event = &frame["event"];
+                event["type"] == "approval.resolved"
+                    && event["request_id"] == pending["request_id"]
+                    && event["allow"] == true
+            }));
             assert_eq!(std::fs::read_to_string(fixture.workspace.path().join("new.txt")).unwrap(), "hi");
         })
         .await;
@@ -631,6 +637,33 @@ async fn full_send_does_not_let_an_unverified_peer_attach_desktop_control() {
                             .is_some_and(|name| name.starts_with("computer_"))
                     })
             );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn turn_failures_expose_only_actionable_provider_errors() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for (error, expected) in [
+                (crate::provider::GATEWAY_UNAVAILABLE, "gateway-unavailable"),
+                (crate::provider::PROVIDER_TIMEOUT, "provider-timeout"),
+                ("private upstream detail", "request-unavailable"),
+            ] {
+                let complete: Complete = Rc::new(move |_, _| Box::pin(async move { fail(error) }));
+                let fixture = start_with(json!({}), complete).await;
+                let id = session(&fixture).await;
+                let frames = request(
+                    &fixture.socket,
+                    json!({"method": "turn.start", "session_id": id, "prompt": "hello"}),
+                )
+                .await;
+                assert_eq!(frames.last(), Some(&json!({"ok": false, "error": expected})));
+                assert!(frames.iter().any(|frame| {
+                    frame["event"]["type"] == "turn.completed"
+                        && frame["event"]["status"] == "failed"
+                }));
+            }
         })
         .await;
 }

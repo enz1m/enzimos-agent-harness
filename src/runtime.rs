@@ -419,12 +419,16 @@ impl Session {
 struct ApprovalGuard {
     session: Shared,
     request_id: String,
+    allow: Option<bool>,
 }
 impl Drop for ApprovalGuard {
     fn drop(&mut self) {
         if let Ok(mut session) = self.session.try_borrow_mut() {
             session.pending.remove(&self.request_id);
-            session.emit("approval.resolved", json!({"request_id": self.request_id}));
+            session.emit(
+                "approval.resolved",
+                json!({"request_id": self.request_id, "allow": self.allow}),
+            );
         }
     }
 }
@@ -454,18 +458,22 @@ async fn approval(
         );
         s.emit("approval.requested", json!({"request_id": request_id, "binding": binding, "call_id": call_id, "tool": name, "arguments": arguments}));
     }
-    let _guard = ApprovalGuard {
+    let mut guard = ApprovalGuard {
         session: session.clone(),
         request_id,
+        allow: None,
     };
-    match tokio::time::timeout(Duration::from_secs(90), receiver).await {
+    let allowed = match tokio::time::timeout(Duration::from_secs(90), receiver).await {
         Ok(Ok(ApprovalDecision::Session)) => {
             session.borrow_mut().allowed_tools.insert(grant.to_owned());
             true
         }
         Ok(Ok(ApprovalDecision::Once)) => true,
-        _ => false,
-    }
+        Ok(Ok(ApprovalDecision::Deny)) => false,
+        _ => return false,
+    };
+    guard.allow = Some(allowed);
+    allowed
 }
 
 async fn invoke(

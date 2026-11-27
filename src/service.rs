@@ -836,13 +836,13 @@ impl Service {
                         let gateway = service
                             .gateway
                             .as_ref()
-                            .ok_or_else(|| ToolError("local models unavailable".into()))?;
+                            .ok_or_else(|| ToolError(crate::provider::LOCAL_MODELS_UNAVAILABLE.into()))?;
                         crate::local::pick_model(
                             &gateway.local_models().await?,
                             task,
                             screenshots != Access::Off,
                         )
-                        .ok_or_else(|| ToolError("local models unavailable".into()))?
+                        .ok_or_else(|| ToolError(crate::provider::LOCAL_MODELS_UNAVAILABLE.into()))?
                     } else {
                         session.borrow().model.clone()
                     };
@@ -862,7 +862,7 @@ impl Service {
                 };
                 tokio::time::timeout(Duration::from_secs(600), work)
                     .await
-                    .unwrap_or_else(|_| fail("turn deadline exceeded"))
+                    .unwrap_or_else(|_| fail(crate::provider::PROVIDER_TIMEOUT))
             })
         };
         session.borrow_mut().task = Some(task.abort_handle());
@@ -912,8 +912,8 @@ impl Service {
             Some(Ok(Ok(()))) => {
                 Self::send(writer, &json!({"ok": true, "turn_finished": true})).await
             }
-            Some(Ok(Err(error))) if error.0 == Skills::CHANGED => Err(error),
-            Some(_) => fail("turn failed"),
+            Some(Ok(Err(error))) => Err(error),
+            Some(Err(_)) => fail("turn failed"),
         }
     }
 
@@ -1002,10 +1002,10 @@ impl Service {
         .await;
         if let Err(error) = result {
             // Only reasons a client can act on are distinguished.
-            let code = if error.0 == Skills::CHANGED {
-                Skills::CHANGED
-            } else {
-                "request-unavailable"
+            use crate::provider::{GATEWAY_UNAVAILABLE, LOCAL_MODELS_UNAVAILABLE, PROVIDER_TIMEOUT};
+            let code = match error.0.as_str() {
+                Skills::CHANGED | GATEWAY_UNAVAILABLE | LOCAL_MODELS_UNAVAILABLE | PROVIDER_TIMEOUT => error.0.as_str(),
+                _ => "request-unavailable",
             };
             let _ = Self::send(&mut writer, &json!({"ok": false, "error": code})).await;
         }

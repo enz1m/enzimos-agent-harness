@@ -13,6 +13,9 @@ use tokio::{
 };
 
 pub(crate) const IMAGE_REJECTED: &str = "provider rejected images";
+pub(crate) const GATEWAY_UNAVAILABLE: &str = "gateway-unavailable";
+pub(crate) const LOCAL_MODELS_UNAVAILABLE: &str = "local-models-unavailable";
+pub(crate) const PROVIDER_TIMEOUT: &str = "provider-timeout";
 
 const LIMIT: usize = 2 * 1024 * 1024;
 
@@ -290,8 +293,13 @@ pub async fn read_head<R: tokio::io::AsyncBufRead + Unpin>(
 
 impl Gateway {
     async fn connect(&self) -> Result<UnixStream> {
-        let info = std::fs::symlink_metadata(&self.path)
-            .map_err(|_| ToolError("private owned gateway socket required".into()))?;
+        let info = std::fs::symlink_metadata(&self.path).map_err(|error| {
+            ToolError(if error.kind() == std::io::ErrorKind::NotFound {
+                GATEWAY_UNAVAILABLE.into()
+            } else {
+                "private owned gateway socket required".into()
+            })
+        })?;
         let parent = self
             .path
             .parent()
@@ -307,7 +315,7 @@ impl Gateway {
         }
         let stream = UnixStream::connect(&self.path)
             .await
-            .map_err(|_| ToolError("gateway unavailable".into()))?;
+            .map_err(|_| ToolError(GATEWAY_UNAVAILABLE.into()))?;
         if stream.peer_cred().map(|c| c.uid()).ok() != Some(uid()) {
             return fail("gateway peer refused");
         }
@@ -319,18 +327,18 @@ impl Gateway {
             let (reader, mut writer) = self.connect().await?.into_split();
             writer.write_all(b"GET /v1/models?provider=local HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
                 .await
-                .map_err(|_| ToolError("gateway unavailable".into()))?;
+                .map_err(|_| ToolError(GATEWAY_UNAVAILABLE.into()))?;
             let mut reader = BufReader::new(reader);
             let (status, headers) = read_head(&mut reader).await?;
             if status != 200 {
-                return fail("local models unavailable");
+                return fail(LOCAL_MODELS_UNAVAILABLE);
             }
             let data = read_body(&mut reader, &headers, LIMIT).await?;
             serde_json::from_slice(&data).map_err(|_| ToolError("invalid model list".into()))
         };
         tokio::time::timeout(Duration::from_secs(15), exchange)
             .await
-            .map_err(|_| ToolError("local models unavailable".into()))?
+            .map_err(|_| ToolError(PROVIDER_TIMEOUT.into()))?
     }
 
     /// Request one completion and forward any streamed text to `delta`.
@@ -360,7 +368,7 @@ impl Gateway {
             writer
                 .write_all(request.as_bytes())
                 .await
-                .map_err(|_| ToolError("gateway unavailable".into()))?;
+                .map_err(|_| ToolError(GATEWAY_UNAVAILABLE.into()))?;
             let mut reader = BufReader::new(reader);
             let (status, headers) = read_head(&mut reader).await?;
             if status != 200 {
@@ -374,6 +382,9 @@ impl Gateway {
                     {
                         return fail(IMAGE_REJECTED);
                     }
+                }
+                if status == 504 {
+                    return fail(PROVIDER_TIMEOUT);
                 }
                 return fail("selected provider unavailable");
             }
@@ -408,9 +419,9 @@ impl Gateway {
         };
         tokio::time::timeout(Duration::from_secs(180), exchange)
             .await
-            .map_err(|_| ToolError("selected provider response unavailable".into()))?
+            .map_err(|_| ToolError(PROVIDER_TIMEOUT.into()))?
             .map_err(|error| match error.0.as_str() {
-                IMAGE_REJECTED => error,
+                IMAGE_REJECTED | GATEWAY_UNAVAILABLE | PROVIDER_TIMEOUT => error,
                 _ => ToolError("selected provider response unavailable".into()),
             })
     }
