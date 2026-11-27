@@ -361,6 +361,55 @@ impl Workspace {
         Ok(json!({"sha256": sha256_hex(text.as_bytes()), "bytes": text.len(), "backup":backup}))
     }
 
+    #[allow(
+        unsafe_code,
+        reason = "Linux descriptor-relative rename without overwrite."
+    )]
+    pub(crate) fn rename(&self, source: &str, new_name: &str) -> Result<Value> {
+        if new_name.is_empty() || ["..", "."].contains(&new_name) || new_name.contains('/') {
+            return fail("rename requires a new name without a folder path");
+        }
+        let (parent, old_name) = self.parent(source)?;
+        let destination = Path::new(source).with_file_name(new_name);
+        for relative in [Path::new(source), destination.as_path()] {
+            let parts = relative
+                .to_str()
+                .unwrap_or_default()
+                .split('/')
+                .collect::<Vec<_>>();
+            // Renaming a protected entry's ancestor would move it out of its exclusion.
+            if self.excluded(&parts)
+                || self.exclusions.iter().any(|prefix| {
+                    prefix.len() >= parts.len()
+                        && prefix.iter().zip(&parts).all(|(left, right)| left == right)
+                })
+            {
+                return fail("protected service data is outside tool authority");
+            }
+        }
+        let from =
+            CString::new(old_name).map_err(|_| ToolError("invalid workspace path".into()))?;
+        let to = CString::new(new_name).map_err(|_| ToolError("invalid workspace path".into()))?;
+        // SAFETY: The owned descriptor and both C strings outlive the syscall.
+        if unsafe {
+            libc::renameat2(
+                parent.as_raw_fd(),
+                from.as_ptr(),
+                parent.as_raw_fd(),
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } == 0
+        {
+            return Ok(json!({"path": destination, "renamed_from": source}));
+        }
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::AlreadyExists => fail("rename destination already exists"),
+            std::io::ErrorKind::NotFound => fail("workspace path unavailable"),
+            _ => fail("could not rename the workspace entry"),
+        }
+    }
+
     pub fn list(&self, relative: Option<&str>) -> Result<Value> {
         let fd = match relative {
             None => dup(&self.fd)?,
@@ -661,6 +710,25 @@ pub(crate) mod tests {
 
     pub(crate) fn workspace_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn rename_keeps_existing_entries_and_protected_subtrees() {
+        let dir = workspace_dir();
+        let root = dir.path();
+        let private = root.join("settings/private");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(root.join("original"), b"photo").unwrap();
+        std::fs::write(root.join("occupied"), b"keep").unwrap();
+        let ws = Workspace::new(root, &[private]).unwrap();
+
+        assert!(ws.rename("original", "occupied").is_err());
+        assert!(ws.rename("original", "../outside").is_err());
+        assert!(ws.rename("settings", "renamed-settings").is_err());
+        assert_eq!(std::fs::read(root.join("occupied")).unwrap(), b"keep");
+        assert_eq!(ws.rename("original", "beach").unwrap()["path"], "beach");
+        assert_eq!(std::fs::read(root.join("beach")).unwrap(), b"photo");
+        assert!(!root.join("original").exists());
     }
 
     #[test]

@@ -54,6 +54,12 @@ fn tools_schema(screenshots: Access) -> Vec<Value> {
             json!(["argv"]),
         ),
     ];
+    tools.push(tool(
+        "file_rename",
+        "Rename a workspace file or folder in place. path is workspace-relative. new_name is a single name. Existing entries are kept.",
+        json!({"path":{"type":"string"}, "new_name":{"type":"string"}}),
+        json!(["path", "new_name"]),
+    ));
     if screenshots != Access::Off {
         tools.push(tool(
             "screenshot",
@@ -73,6 +79,18 @@ const CORRECTABLE: &[(&str, &str)] = &[
         "workspace-relative path required: name it from the workspace, such as \"todo.txt\"",
     ),
     ("invalid workspace path", "invalid workspace path"),
+    (
+        "rename destination already exists",
+        "A file or folder already has that name. Choose a different name.",
+    ),
+    (
+        "rename requires a new name without a folder path",
+        "Use a single name for the destination. The entry stays in the same folder.",
+    ),
+    (
+        "could not rename the workspace entry",
+        "Could not rename that entry. Check the folder permissions and the name.",
+    ),
     (
         "workspace path unavailable",
         "no such file or folder in the workspace; call files_list with a null path to see what is there",
@@ -412,7 +430,7 @@ impl Session {
         {
             return false;
         }
-        !(name == "file_write"
+        !(matches!(name, "file_write" | "file_rename")
             && self.approval_mode == ApprovalMode::WorkspaceEdits
             && arguments["path"]
                 .as_str()
@@ -594,6 +612,10 @@ async fn invoke(
                     })
             }
             "file_read" => session.borrow().workspace.read(&text("path")?),
+            "file_rename" => session
+                .borrow()
+                .workspace
+                .rename(&text("path")?, &text("new_name")?),
             "file_write" => {
                 let expected = match &arguments["expected_sha256"] {
                     Value::Null => None,
@@ -876,12 +898,19 @@ pub(crate) async fn run_configured(
                     answer_read = true;
                 }
             }
+            let desktop_generation = session
+                .borrow()
+                .desktop
+                .as_ref()
+                .filter(|control| control.active && !control.commands.is_closed())
+                .map(|control| control.generation.clone());
             let local = Profile::for_model(
                 &provider,
                 model,
                 if answer_read { Task::Text } else { task },
                 instructions.unwrap_or_default(),
                 &full_tools,
+                desktop_generation.is_some() && !answer_read,
             );
             let (instructions, profile_tools) = match &local {
                 Some(profile) => (
@@ -890,12 +919,6 @@ pub(crate) async fn run_configured(
                 ),
                 None => (instructions, full_tools.as_slice()),
             };
-            let desktop_generation = session
-                .borrow()
-                .desktop
-                .as_ref()
-                .filter(|control| control.active && !control.commands.is_closed())
-                .map(|control| control.generation.clone());
             let mut tools = profile_tools.to_vec();
             if desktop_generation.is_some() && !answer_read {
                 tools.extend(desktop::schemas());
@@ -967,6 +990,9 @@ pub(crate) async fn run_configured(
             }
             let direct = direct
                 .filter(|(name, _)| tools.iter().any(|tool| tool["function"]["name"] == *name));
+            let direct_rename = direct
+                .as_ref()
+                .is_some_and(|(name, _)| *name == "file_rename");
             let direct_read = direct
                 .as_ref()
                 .is_some_and(|(name, _)| *name == "file_read");
@@ -1067,7 +1093,12 @@ pub(crate) async fn run_configured(
                         fail("invalid tool request")
                     }
                 };
-                if task == Task::Screen
+                let declined = result
+                    .as_ref()
+                    .is_err_and(|error| error.0 == ACTION_DECLINED);
+                if declined {
+                    guidance = Some("The action was declined or its approval expired.");
+                } else if task == Task::Screen
                     && function["name"] == "screenshot"
                     && let Err(error) = &result
                     && matches!(
@@ -1076,10 +1107,15 @@ pub(crate) async fn run_configured(
                             | screenshot::UNAVAILABLE
                             | screenshot::UNSUPPORTED
                             | screenshot::DECLINED
-                            | ACTION_DECLINED
                     )
                 {
                     guidance = Some(model_error(error));
+                }
+                if direct_rename && !declined {
+                    guidance = Some(match &result {
+                        Ok(_) => "Renamed the workspace entry.",
+                        Err(error) => model_error(error),
+                    });
                 }
                 if direct_read {
                     match &result {
@@ -1120,9 +1156,13 @@ pub(crate) async fn run_configured(
                 }
                 s.messages
                     .push(json!({"role": "tool", "tool_call_id": call_id, "content": content}));
+                if declined {
+                    break;
+                }
             }
             if let Some(guidance) = guidance {
                 let mut s = session.borrow_mut();
+                close_batch(&mut s.messages);
                 s.messages.push(assistant(guidance, vec![]));
                 s.emit("message.completed", json!({"content": guidance}));
                 if s.steers.is_empty() {

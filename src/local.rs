@@ -12,8 +12,45 @@ pub(crate) enum Task {
     Text,
     Files,
     Write,
+    Rename,
     Screen,
     Full,
+}
+
+fn rename_operand(input: &str) -> Option<(&str, &str)> {
+    let input = input.trim_start();
+    if let Some(quote @ ('"' | '\'' | '`')) = input.chars().next() {
+        return input.strip_prefix(quote)?.split_once(quote);
+    }
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    Some(input.split_at(end))
+}
+
+fn rename_paths(prompt: &str) -> Option<(&str, &str)> {
+    let (first, rest) = prompt.trim().split_once(char::is_whitespace)?;
+    let (verb, arguments) = if first.eq_ignore_ascii_case("please") {
+        rest.trim_start().split_once(char::is_whitespace)?
+    } else {
+        (first, rest)
+    };
+    if !verb.eq_ignore_ascii_case("rename") {
+        return None;
+    }
+    let (path, rest) = rename_operand(arguments)?;
+    let (connector, new) = rest.trim_start().split_once(char::is_whitespace)?;
+    if path.is_empty() || !connector.eq_ignore_ascii_case("to") {
+        return None;
+    }
+    let (name, tail) = rename_operand(new)?;
+    let name = if new.trim_start().starts_with(['"', '\'', '`']) {
+        name
+    } else {
+        name.trim_end_matches(['.', '!', '?'])
+    };
+    (!name.is_empty()
+        && !name.contains('/')
+        && tail.trim().chars().all(|ch| matches!(ch, '.' | '!' | '?')))
+    .then_some((path, name))
 }
 
 impl Task {
@@ -56,6 +93,10 @@ impl Task {
                 let target = if window { "focused_window" } else { "screen" };
                 Some(("screenshot", json!({"target": target})))
             }
+            Self::Rename => {
+                let (path, new_name) = rename_paths(prompt)?;
+                Some(("file_rename", json!({"path": path, "new_name": new_name})))
+            }
             Self::Files => {
                 let mut words = prompt.split_whitespace();
                 let verb = words.next()?;
@@ -94,7 +135,12 @@ impl Task {
             .filter(|word| !word.is_empty())
             .collect::<Vec<_>>();
         let command = |word| matches!(word, "run" | "execute" | "invoke");
-        let first_action = words.iter().find(|word| **word != "please");
+        let first_action = match words.as_slice() {
+            ["can" | "could" | "would", "you", rest @ ..] => rest,
+            words => words,
+        }
+        .iter()
+        .find(|word| **word != "please");
         if first_action.is_some_and(|word| command(*word))
             || (words.iter().copied().any(command)
                 && ["command", "script", "terminal", "shell", "tool"]
@@ -112,9 +158,20 @@ impl Task {
                         && extension.chars().all(|ch| ch.is_ascii_alphabetic())
                 })
         });
-        let workspace = words
-            .iter()
-            .any(|word| matches!(*word, "workspace" | "folder" | "directory"));
+        let workspace = words.iter().any(|word| {
+            matches!(
+                *word,
+                "workspace"
+                    | "folder"
+                    | "directory"
+                    | "carpeta"
+                    | "directorio"
+                    | "mappa"
+                    | "mappában"
+                    | "mappát"
+                    | "mappámban"
+            )
+        });
         let action = |word| {
             matches!(
                 word,
@@ -148,6 +205,9 @@ impl Task {
             || named_file
             || (follows_tools && reference && words.iter().copied().any(action))
         {
+            if first_action == Some(&"rename") {
+                return Self::Rename;
+            }
             let writing = words.iter().any(|word| {
                 matches!(
                     *word,
@@ -155,13 +215,6 @@ impl Task {
                 )
             });
             if writing { Self::Write } else { Self::Files }
-        } else if prompt
-            .chars()
-            .any(|ch| ch.is_alphabetic() && !ch.is_ascii())
-        {
-            // The keyword rules above are English; elsewhere keep the file tools
-            // rather than risk answering a file request without them.
-            Self::Files
         } else {
             Self::Text
         }
@@ -200,6 +253,7 @@ impl Profile {
         task: Task,
         full_instructions: &str,
         full_tools: &[Value],
+        desktop_available: bool,
     ) -> Option<Self> {
         if provider != "local" {
             return None;
@@ -208,19 +262,36 @@ impl Profile {
         if task == Task::Write && model == "qwen3.5-0.8b" {
             return Some(Self {
                 instructions: full_instructions.to_owned(),
-                tools: full_tools.to_vec(),
+                tools: full_tools
+                    .iter()
+                    .filter(|tool| tool["function"]["name"] != "file_rename")
+                    .cloned()
+                    .collect(),
                 optional_digest: false,
                 tune_sampling: false,
             });
         }
         let mut instructions = format!("{}{model_prompt}", PROFILES["prompt"].as_str()?);
         let tools = match task {
-            Task::Text => Vec::new(),
+            Task::Text => {
+                if !desktop_available {
+                    instructions.push_str(PROFILES["chat_only"].as_str()?);
+                }
+                Vec::new()
+            }
             Task::Screen => full_tools
                 .iter()
                 .filter(|tool| tool["function"]["name"] == "screenshot")
                 .cloned()
                 .collect(),
+            Task::Rename => {
+                instructions.push_str(PROFILES["workspace"].as_str()?);
+                full_tools
+                    .iter()
+                    .filter(|tool| tool["function"]["name"] == "file_rename")
+                    .cloned()
+                    .collect()
+            }
             Task::Files | Task::Write => {
                 instructions.push_str(PROFILES["workspace"].as_str()?);
                 if task == Task::Write {
@@ -320,10 +391,40 @@ mod tests {
     }
 
     #[test]
-    fn requests_without_english_keywords_keep_the_file_tools() {
+    fn explicit_rename_binds_the_original_path_and_destination_name() {
+        assert_eq!(
+            Task::Rename
+                .direct_tool("Please rename \"reports/April notes.txt\" to \"May notes.txt\"."),
+            Some((
+                "file_rename",
+                json!({"path":"reports/April notes.txt", "new_name":"May notes.txt"})
+            ))
+        );
+        assert_eq!(
+            Task::Rename.direct_tool("Rename notes/plan.md to outline.md."),
+            Some((
+                "file_rename",
+                json!({"path":"notes/plan.md", "new_name":"outline.md"})
+            ))
+        );
+        assert_eq!(
+            Task::Rename.direct_tool("Rename plan.md to outline.md and share it"),
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_evidence_selects_file_tools_independently_of_language() {
         assert!(Task::classify("What is the capital of France?", false) == Task::Text);
         assert!(Task::classify("Read todo.txt", false) == Task::Files);
         assert!(Task::classify("Mi van ebben a mappában?", false) == Task::Files);
         assert!(Task::classify("olvasd el a todo.txt fájlt", false) == Task::Files);
+        assert!(Task::classify("Fordítsd le angolra: Hamarosan találkozunk.", false) == Task::Text);
+        assert!(
+            Task::classify("Could you rename photos/old.jpg to new.jpg", false) == Task::Rename
+        );
+        assert!(Task::classify("¿Qué hay en mi carpeta?", false) == Task::Files);
+        assert!(Task::classify("¿Puedes explicar la fotosíntesis?", false) == Task::Text);
+        assert!(Task::classify("Fogalmazz meg egy születésnapi üdvözletet.", false) == Task::Text);
     }
 }

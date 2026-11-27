@@ -1,9 +1,10 @@
 {
-  "prompt": "You are the enzimOS assistant. Follow the requested format. Use earlier messages to resolve follow-ups. For rewrites and summaries, use the supplied text.",
+  "prompt": "You are the enzimOS assistant. Match the requested language and format. Use chat history and attached text.",
+  "chat_only": " For device requests, explain that you can only give instructions. Give one brief manual step.",
   "workspace": " Use file tools for workspace requests. Paths are relative. Report success only after a successful tool result.",
   "models": {
     "minicpm5-1b": " Answer directly and briefly.",
-    "qwen3.5-0.8b": " Return just the requested answer.",
+    "qwen3.5-0.8b": " Answer concisely. Keep lists to one short line per item and follow requested item counts.",
     "lfm3-vl-2b": " Keep the reply concise and factual."
   },
   "sampling": {

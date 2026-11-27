@@ -285,8 +285,7 @@ async fn broad_approvals_require_live_consent_and_keep_workspace_boundaries() {
             let (fixture, _) = start(json!({"approval_default": "full_send", "allow_writes": true}), vec![
                 runtime::assistant("", vec![write("w1", "with-consent"), write("w2", "with-grant")]),
                 runtime::assistant("done", vec![]),
-                runtime::assistant("", vec![write("w3", "auto-edit"), write("w4", "../outside")]),
-                runtime::assistant("done", vec![]),
+                runtime::assistant("", vec![write("w3", "auto-edit"), write("w4", "../outside"), write("w4b", "skipped")]),
                 runtime::assistant("", vec![write("w5", "../outside")]),
                 runtime::assistant("done", vec![]),
             ]).await;
@@ -328,7 +327,10 @@ async fn broad_approvals_require_live_consent_and_keep_workspace_boundaries() {
             assert_eq!(std::fs::read_to_string(fixture.workspace.path().join("auto-edit")).unwrap(), "w3");
             send(json!({"method":"approval.resolve", "session_id":edited,
                 "request_id":pending["request_id"], "binding":pending["binding"], "allow":false})).await;
-            assert_eq!(turn.await.unwrap().last().unwrap()["turn_finished"], true);
+            let frames = turn.await.unwrap();
+            assert_eq!(frames.last().unwrap()["turn_finished"], true);
+            assert!(!frames.iter().any(|f| f["event"]["call_id"] == "w4b"));
+            assert!(!fixture.workspace.path().join("skipped").exists());
 
             assert_eq!(send(json!({"method": "session.set_approval_mode", "session_id": edited,
                 "approval_mode": "full_send", "confirm_full_send": true})).await[0]["ok"], true);
