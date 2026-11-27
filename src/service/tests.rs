@@ -781,3 +781,86 @@ async fn revising_keeps_attachments_and_preserves_the_saved_reply_on_failure() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn steering_withdraws_unconsumed_approval_and_keeps_completed_receipts() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let (fixture, rounds) = start(
+                json!({}),
+                vec![
+                    runtime::assistant(
+                        "",
+                        vec![
+                            call("read", "file_read", json!({"path":"agenda.txt"})),
+                            call(
+                                "write",
+                                "file_write",
+                                json!({"path":"result.txt","text":"old"}),
+                            ),
+                        ],
+                    ),
+                    runtime::assistant("I read the agenda and skipped the write.", vec![]),
+                ],
+            )
+            .await;
+            std::fs::write(fixture.workspace.path().join("agenda.txt"), "Agenda").unwrap();
+            let id = session(&fixture).await;
+            let socket = fixture.socket.clone();
+            let turn = tokio::task::spawn_local({
+                let id = id.clone();
+                async move {
+                    request(
+                        &socket,
+                        json!({"method":"turn.start","session_id":id,"prompt":"read and write"}),
+                    )
+                    .await
+                }
+            });
+            let pending =
+                tokio::time::timeout(Duration::from_secs(3), approval_requested(&fixture, &id))
+                    .await
+                    .unwrap();
+            let steer = request(
+                &fixture.socket,
+                json!({"method":"turn.steer","session_id":id,"text":"Skip the write"}),
+            )
+            .await;
+            assert_eq!(steer[0]["ok"], true);
+            let late = request(
+                &fixture.socket,
+                json!({"method":"approval.resolve","session_id":id,
+            "request_id":pending["request_id"],"binding":pending["binding"],"allow":true}),
+            )
+            .await;
+            assert_eq!(late[0]["ok"], false);
+            let frames = tokio::time::timeout(Duration::from_secs(3), turn)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| frame["event"]["call_id"] == "read"
+                        && frame["event"]["status"] == "completed")
+            );
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| frame["event"]["call_id"] == "write"
+                        && frame["event"]["status"] == "cancelled")
+            );
+            assert!(!fixture.workspace.path().join("result.txt").exists());
+            let requests = rounds.borrow();
+            let messages = requests[1]["messages"].as_array().unwrap();
+            assert!(messages.iter().any(|m| m["tool_call_id"] == "read"
+                && m["content"].as_str().is_some_and(|c| c.contains("Agenda"))));
+            assert!(messages.iter().any(|m| {
+                m["tool_call_id"] == "write"
+                    && m["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains(runtime::STEERED))
+            }));
+        })
+        .await;
+}

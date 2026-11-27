@@ -15,6 +15,8 @@ use tokio::{
 pub(crate) const IMAGE_REJECTED: &str = "provider rejected images";
 pub(crate) const GATEWAY_UNAVAILABLE: &str = "gateway-unavailable";
 pub(crate) const LOCAL_MODELS_UNAVAILABLE: &str = "local-models-unavailable";
+pub(crate) const MODEL_OUT_OF_MEMORY: &str = "model-out-of-memory";
+pub(crate) const MODEL_UNSUPPORTED: &str = "model-unsupported-architecture";
 pub(crate) const PROVIDER_TIMEOUT: &str = "provider-timeout";
 
 const LIMIT: usize = 2 * 1024 * 1024;
@@ -387,6 +389,7 @@ impl Gateway {
         if raw.len() > LIMIT {
             return fail("provider request exceeds limit");
         }
+        let local = body["provider"] == "local";
         let session = body["conversation_id"].as_str().unwrap_or("-");
         let start = std::time::Instant::now();
         let exchange = async {
@@ -404,19 +407,26 @@ impl Gateway {
             let (status, headers) = read_head(&mut reader).await?;
             crate::timing::phase(session, "provider_headers", start);
             if status != 200 {
-                if has_image {
-                    if matches!(status, 400 | 415 | 422) {
-                        return fail(IMAGE_REJECTED);
-                    }
-                    if let Ok(data) = read_body(&mut reader, &headers, 32 * 1024).await
-                        && let Ok(value) = serde_json::from_slice::<Value>(&data)
-                        && image_error(&value["error"])
-                    {
-                        return fail(IMAGE_REJECTED);
-                    }
+                if has_image && matches!(status, 400 | 415 | 422) {
+                    return fail(IMAGE_REJECTED);
                 }
                 if status == 504 {
                     return fail(PROVIDER_TIMEOUT);
+                }
+                if (local && status == 503 || has_image)
+                    && let Ok(data) = read_body(&mut reader, &headers, 32 * 1024).await
+                    && let Ok(value) = serde_json::from_slice::<Value>(&data)
+                {
+                    if local && status == 503 {
+                        match value["error"]["code"].as_str() {
+                            Some(MODEL_OUT_OF_MEMORY) => return fail(MODEL_OUT_OF_MEMORY),
+                            Some(MODEL_UNSUPPORTED) => return fail(MODEL_UNSUPPORTED),
+                            _ => {}
+                        }
+                    }
+                    if has_image && image_error(&value["error"]) {
+                        return fail(IMAGE_REJECTED);
+                    }
                 }
                 return fail("selected provider unavailable");
             }
@@ -467,7 +477,8 @@ impl Gateway {
             .await
             .map_err(|_| ToolError(PROVIDER_TIMEOUT.into()))?
             .map_err(|error| match error.0.as_str() {
-                IMAGE_REJECTED | GATEWAY_UNAVAILABLE | PROVIDER_TIMEOUT => error,
+                IMAGE_REJECTED | GATEWAY_UNAVAILABLE | PROVIDER_TIMEOUT | MODEL_OUT_OF_MEMORY
+                | MODEL_UNSUPPORTED => error,
                 _ => ToolError("selected provider response unavailable".into()),
             })
     }

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 //! Bounded explicit stdio MCP host, including the enrolled Center adapter, and
 //! the per-turn aggregation of configured servers' tools.
+pub(crate) mod routing;
+
 use crate::{Result, ToolError, fail, http_mcp::HttpClient, sha256_hex};
 use serde_json::{Value, json};
 use std::{
@@ -262,7 +264,9 @@ pub struct Mcp {
     routes: RefCell<BTreeMap<String, (Rc<Client>, String)>>,
     pub schemas: RefCell<Vec<Value>>,
     center: RefCell<Option<Rc<StdioClient>>>,
-    center_routes: RefCell<BTreeMap<String, (&'static str, &'static str)>>,
+    center_routes: RefCell<BTreeMap<String, CenterRoute>>,
+    pub(crate) center_availability: RefCell<Vec<Value>>,
+    workspace_read: RefCell<Option<Value>>,
     approval_identities: RefCell<BTreeMap<String, String>>,
 }
 
@@ -293,6 +297,8 @@ impl Mcp {
             schemas: RefCell::new(vec![]),
             center: RefCell::default(),
             center_routes: RefCell::default(),
+            center_availability: RefCell::default(),
+            workspace_read: RefCell::default(),
             approval_identities: RefCell::default(),
         })
     }
@@ -305,7 +311,44 @@ impl Mcp {
         self.center_routes.borrow().contains_key(alias)
     }
 
-    pub(crate) async fn start_center(&self, browser: bool) -> Result<()> {
+    pub(crate) fn desktop_identity(&self, alias: &str) -> Option<Value> {
+        let routes = self.center_routes.borrow();
+        let route = routes.get(alias)?;
+        Some(
+            json!({"app_id":route.app,"function_id":route.id,"manifest":route.manifest,
+            "title":route.function["title"],"risk":route.function["risk"],
+            "supports_cancellation":route.function["supports_cancellation"]}),
+        )
+    }
+
+    pub(crate) async fn start_center(&self, prompt: &str, workspace: Option<Value>) -> Result<()> {
+        self.schemas.borrow_mut().retain(|tool| {
+            !tool["function"]["name"]
+                .as_str()
+                .is_some_and(|name| self.uses_center(name))
+        });
+        self.center_routes.borrow_mut().clear();
+        self.workspace_read
+            .replace(workspace.filter(|_| prompt.to_lowercase().contains("workspace")));
+        self.center_availability.replace(
+            routing::expected_apps(prompt)
+                .map(|name| missing_app(name, prompt))
+                .collect(),
+        );
+        let disconnected = self.center.borrow().is_none();
+        if disconnected {
+            let client = Self::connect_center().await?;
+            self.center.replace(Some(client));
+        }
+        let client = self
+            .center
+            .borrow()
+            .clone()
+            .ok_or_else(|| ToolError(CENTER_UNAVAILABLE.into()))?;
+        self.discover_center(&client, prompt).await
+    }
+
+    async fn connect_center() -> Result<Rc<StdioClient>> {
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .map(std::path::PathBuf::from)
             .filter(|path| path.is_absolute())
@@ -331,50 +374,107 @@ impl Mcp {
             &Value::Null,
         )?;
         client.start().await?;
+        Ok(client)
+    }
+
+    async fn discover_center(&self, client: &StdioClient, prompt: &str) -> Result<()> {
         let mut schemas = Vec::new();
         let mut routes = BTreeMap::new();
-        // Inspection is independent of the prompt and preserves the order of the model prefix.
-        let apps = [(SETTINGS_APP, CENTER_TOOLS), (BROWSER_APP, BROWSER_TOOLS)];
-        for (app, tools) in apps {
-            if app == BROWSER_APP && !browser {
+        let mut availability = Vec::new();
+        let mut apps = Vec::new();
+        let mut cursor = Value::Null;
+        for _ in 0..4 {
+            let page =
+                center_query(client, "enzui_apps", json!({"limit":32,"cursor":cursor})).await?;
+            apps.extend(page["apps"].as_array().into_iter().flatten().cloned());
+            cursor = page["next_cursor"].clone();
+            if cursor.is_null() {
+                break;
+            }
+        }
+        let mut candidates = Vec::new();
+        for app in &apps {
+            let (Some(id), Some(name)) = (app["id"].as_str(), app["name"].as_str()) else {
+                continue;
+            };
+            if id != "dev.enzui.Settings" && !routing::named_app(prompt, name) {
                 continue;
             }
-            for (alias, id, description) in tools {
-                let reply = client
-                    .request(
-                        "tools/call",
-                        json!({
-                            "name":"enzui_function",
-                            "arguments":{"app_id":app, "function_id":id}
-                        }),
-                    )
-                    .await;
-                let result = reply.and_then(|reply| center_result(&reply));
-                let Ok(result) = result else {
-                    if app == SETTINGS_APP {
-                        return fail(CENTER_UNAVAILABLE);
-                    }
-                    break;
-                };
-                let function = &result["function"];
-                if function["id"] != *id || function["input_schema"]["type"] != "object" {
-                    if app == SETTINGS_APP {
-                        return fail(CENTER_UNAVAILABLE);
-                    }
-                    break;
-                }
-                if self.has(alias) {
-                    return fail("duplicate MCP tool alias");
-                }
-                schemas.push(json!({"type":"function","function":{
-                    "name":alias,"description":description,"parameters":function["input_schema"]
-                }}));
-                routes.insert((*alias).to_owned(), (app, *id));
+            let listing =
+                center_query(client, "enzui_functions", json!({"app_id":id,"limit":50})).await;
+            let mut choices = listing
+                .ok()
+                .and_then(|mut list| list["functions"].take().as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|function| {
+                    let rank = routing::rank(app, &function, prompt);
+                    (rank != 0).then_some((rank, function))
+                })
+                .collect::<Vec<_>>();
+            choices.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
+            if routing::named_app(prompt, name) {
+                availability.push(json!({"app":name,"app_id":id,"installed":app["installed"],
+                    "running":app["running"],"capabilities":[],"missing":routing::requested_capability(name, prompt)}));
             }
+            let limit = if id == "dev.enzui.Settings" { 7 } else { 3 };
+            candidates.extend(
+                choices
+                    .into_iter()
+                    .take(limit)
+                    .map(|(rank, function)| (rank, app, function)),
+            );
+        }
+        for name in routing::expected_apps(prompt) {
+            if !availability.iter().any(|row| {
+                row["app"]
+                    .as_str()
+                    .is_some_and(|app| app.eq_ignore_ascii_case(name))
+            }) {
+                availability.push(missing_app(name, prompt));
+            }
+        }
+        candidates.sort_by_key(|(rank, _, _)| std::cmp::Reverse(*rank));
+        let mut bytes = 0;
+        for (_, app, summary) in candidates.into_iter().take(10) {
+            let id = summary["id"].as_str().unwrap_or_default();
+            let app_id = app["id"].as_str().unwrap_or_default();
+            let Ok(inspected) = center_query(
+                client,
+                "enzui_function",
+                json!({"app_id":app_id,"function_id":id}),
+            )
+            .await
+            else {
+                continue;
+            };
+            let Some(route) = CenterRoute::inspected(app_id, id, inspected) else {
+                continue;
+            };
+            let alias = routing::alias(app, id);
+            if self.routes.borrow().contains_key(&alias) || routes.contains_key(&alias) {
+                continue;
+            }
+            let parameters = routing::parameters(app_id, id, &route.function["input_schema"]);
+            let schema = json!({"type":"function","function":{
+                "name":alias,"description":route.function["description"],"parameters":parameters
+            }});
+            let len = schema.to_string().len();
+            if bytes + len > 4800 {
+                continue;
+            }
+            bytes += len;
+            if let Some(app) = availability.iter_mut().find(|row| row["app_id"] == app_id)
+                && let Some(capabilities) = app["capabilities"].as_array_mut()
+            {
+                capabilities.push(route.function["title"].clone());
+            }
+            schemas.push(schema);
+            routes.insert(alias, route);
         }
         self.schemas.borrow_mut().extend(schemas);
         self.center_routes.replace(routes);
-        self.center.replace(Some(client));
+        self.center_availability.replace(availability);
         Ok(())
     }
 
@@ -579,15 +679,6 @@ impl Mcp {
     /// # Errors
     /// Returns an error for an unknown tool, a refused call or transport failure.
     pub async fn call(&self, alias: &str, arguments: Value) -> Result<Value> {
-        let center_route = self.center_routes.borrow().get(alias).copied();
-        if let Some((app, id)) = center_route {
-            let client = self
-                .center
-                .borrow()
-                .clone()
-                .ok_or_else(|| ToolError(CENTER_UNAVAILABLE.into()))?;
-            return call_center(&client, app, id, arguments).await;
-        }
         let route = self.routes.borrow().get(alias).cloned();
         let (client, name) = route.ok_or_else(|| ToolError("unknown MCP tool".into()))?;
         client
@@ -611,58 +702,196 @@ impl Mcp {
     }
 }
 
-const SETTINGS_APP: &str = "dev.enzui.Settings";
+fn missing_app(name: &str, prompt: &str) -> Value {
+    json!({"app":name,"app_id":routing::desktop_id(name),"installed":null,"running":null,
+        "capabilities":[],"missing":routing::requested_capability(name, prompt)})
+}
+
 pub(crate) const CENTER_UNAVAILABLE: &str = "The desktop MCP Center is unavailable.";
-const BROWSER_APP: &str = "org.enzim.Browser";
-const CENTER_TOOLS: &[(&str, &str, &str)] = &[
-    (
-        "search_settings",
-        "settings.search",
-        "Find a setting's id, current value and allowed values by short query.",
-    ),
-    (
-        "get_setting",
-        "settings.read",
-        "Read a setting by id if search omitted its value.",
-    ),
-    (
-        "set_setting",
-        "settings.change",
-        "Set a value using the id and allowed values from search_settings.",
-    ),
-    (
-        "open_app",
-        "desktop.open",
-        "Open an installed app, or use Files and folder to open a folder.",
-    ),
-    (
-        "start_timer",
-        "desktop.timer",
-        "Start a timer that shows a desktop notification.",
-    ),
-    (
-        "device_status",
-        "desktop.status",
-        "Read live battery, CPU, memory or network status.",
-    ),
-    (
-        "find_downloads",
-        "desktop.downloads",
-        "Find download filenames modified today, yesterday, or on a YYYY-MM-DD date.",
-    ),
-];
-const BROWSER_TOOLS: &[(&str, &str, &str)] = &[
-    (
-        "browser_open",
-        "new_page",
-        "Open a URL in Browser. Returns a page ID.",
-    ),
-    (
-        "browser_read",
-        "take_snapshot",
-        "Read text and headings from a Browser page ID.",
-    ),
-];
+pub(crate) const CENTER_CHANGED: &str = "The app's function catalog changed. Ask me to try again.";
+pub(crate) const SETTING_BOOLEAN: &str = "This setting needs a JSON Boolean: true or false.";
+pub(crate) const SETTING_VALUE: &str =
+    "Use one of the typed values or the number range from search_settings.";
+pub(crate) const FOLDER_REQUIRED: &str =
+    "Files needs a folder. Use the folder name or absolute path requested by the user.";
+pub(crate) const FILES_WRONG_FOLDER: &str =
+    "The selected workspace folder changed. Use files_list or select the folder again.";
+
+#[derive(Clone)]
+struct CenterRoute {
+    app: String,
+    id: String,
+    manifest: String,
+    function: Value,
+}
+
+impl CenterRoute {
+    fn inspected(app: &str, id: &str, mut result: Value) -> Option<Self> {
+        let function = result["function"].take();
+        if result["app_id"] != app
+            || function["id"] != id
+            || function["input_schema"]["type"] != "object"
+            || !function["output_schema"].is_object()
+        {
+            return None;
+        }
+        Some(Self {
+            app: app.to_owned(),
+            id: id.to_owned(),
+            manifest: result["manifest"]
+                .as_str()
+                .filter(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })?
+                .to_owned(),
+            function,
+        })
+    }
+}
+
+async fn center_query(client: &StdioClient, name: &str, arguments: Value) -> Result<Value> {
+    let reply = client
+        .request("tools/call", json!({"name":name,"arguments":arguments}))
+        .await?;
+    center_result(&reply)
+}
+
+fn validate_setting(setting: &Value, value: &Value) -> Result<()> {
+    let allowed = &setting["allowed"];
+    if setting["editable"] != true {
+        return fail(SETTING_VALUE);
+    }
+    if let Some(choices) = allowed.as_array() {
+        if !choices.is_empty() && choices.iter().all(Value::is_boolean) && !value.is_boolean() {
+            return fail(SETTING_BOOLEAN);
+        }
+        if choices.contains(value)
+            || (choices.iter().any(|choice| choice == "#RRGGBB")
+                && value.as_str().is_some_and(|text| {
+                    text.len() == 7
+                        && text.starts_with('#')
+                        && text.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+                }))
+        {
+            return Ok(());
+        }
+        return fail(SETTING_VALUE);
+    }
+    if let (Some(min), Some(max)) = (allowed["min"].as_f64(), allowed["max"].as_f64()) {
+        let relative = allowed["relative"]
+            .as_array()
+            .is_some_and(|values| values.contains(value));
+        if relative
+            || value
+                .as_f64()
+                .is_some_and(|n| n >= min && n <= max && n.fract() == 0.0)
+        {
+            return Ok(());
+        }
+        return fail(SETTING_VALUE);
+    }
+    if setting["id"] == "display/scale" {
+        let scale = value
+            .as_str()
+            .and_then(|value| value.split_once('='))
+            .and_then(|(display, scale)| Some((display, scale.parse::<f64>().ok()?)));
+        let valid = scale.is_some_and(|(display, scale)| {
+            setting["value"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|output| {
+                    output["display"] == display
+                        && output["allowed"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|allowed| allowed.as_f64() == Some(scale))
+                })
+        });
+        return if valid { Ok(()) } else { fail(SETTING_VALUE) };
+    }
+    if let Some(profiles) = setting["value"]["available"].as_array() {
+        return if profiles.contains(value) {
+            Ok(())
+        } else {
+            fail(SETTING_VALUE)
+        };
+    }
+    if value.as_str().is_none_or(|text| {
+        text.trim().is_empty() || text.len() > 128 || text.chars().any(char::is_control)
+    }) {
+        return fail(SETTING_VALUE);
+    }
+    Ok(())
+}
+
+impl Mcp {
+    pub(crate) async fn call_desktop(
+        &self,
+        alias: &str,
+        mut arguments: Value,
+        call_id: &str,
+        stale: impl Fn() -> bool,
+    ) -> Result<Value> {
+        let route = self
+            .center_routes
+            .borrow()
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| ToolError(CENTER_UNAVAILABLE.into()))?;
+        let client = self
+            .center
+            .borrow()
+            .clone()
+            .ok_or_else(|| ToolError(CENTER_UNAVAILABLE.into()))?;
+        if alias == "set_setting" {
+            let inspected = center_query(
+                &client,
+                "enzui_function",
+                json!({"app_id":route.app,"function_id":"settings.read"}),
+            )
+            .await?;
+            let read = CenterRoute::inspected(&route.app, "settings.read", inspected)
+                .ok_or_else(|| ToolError(CENTER_CHANGED.into()))?;
+            if read.manifest != route.manifest {
+                return fail(CENTER_CHANGED);
+            }
+            let setting =
+                call_center(&client, &read, json!({"id":arguments["id"]}), "", &stale).await?;
+            validate_setting(&setting, &arguments["value"])?;
+        }
+        if alias == "open_app"
+            && arguments["app"]
+                .as_str()
+                .is_some_and(|app| app.eq_ignore_ascii_case("Files"))
+            && arguments["folder"]
+                .as_str()
+                .is_none_or(|folder| folder.trim().is_empty())
+        {
+            return fail(FOLDER_REQUIRED);
+        }
+        if route.app == "io.github.enzui.Files" && route.id == "current_folder" {
+            if arguments.get("workspace").is_some() {
+                return fail("Invalid setting or tool arguments.");
+            }
+            if route.function["input_schema"]["properties"]["workspace"].is_object()
+                && let Some(workspace) = self.workspace_read.borrow().as_ref()
+            {
+                arguments["workspace"] = workspace.clone();
+            }
+        }
+        let result = call_center(&client, &route, arguments, call_id, &stale).await;
+        if result
+            .as_ref()
+            .is_err_and(|error| error.0 == crate::runtime::STEERED)
+        {
+            self.center.take();
+            client.close_center().await;
+        }
+        result
+    }
+}
 
 fn center_result(reply: &Value) -> Result<Value> {
     if reply["isError"] == true {
@@ -678,7 +907,14 @@ fn center_result(reply: &Value) -> Result<Value> {
             }
             Some("locked") => crate::device::LOCKED,
             Some("no_backlight") => crate::device::NO_BACKLIGHT,
-            Some("app") => crate::device::APP_UNAVAILABLE,
+            Some("manifest_changed") => CENTER_CHANGED,
+            Some("workspace_folder_mismatch") => FILES_WRONG_FOLDER,
+            Some("launch" | "activation_failed" | "activation_timeout") => {
+                crate::device::APP_LAUNCH_FAILED
+            }
+            Some("restricted") => crate::device::APP_RESTRICTED,
+            Some("unavailable") => crate::device::UNAVAILABLE,
+            Some("app" | "app_unavailable") => crate::device::APP_UNAVAILABLE,
             Some("folder") => crate::device::FOLDER_UNAVAILABLE,
             Some("limit") => crate::device::TIMER_LIMIT,
             _ => CENTER_UNAVAILABLE,
@@ -693,13 +929,26 @@ fn center_result(reply: &Value) -> Result<Value> {
         .ok_or_else(|| ToolError(CENTER_UNAVAILABLE.into()))
 }
 
-async fn call_center(client: &StdioClient, app: &str, id: &str, arguments: Value) -> Result<Value> {
-    let request = json!({"name":"enzui_call","arguments":{
-        "app_id":app, "function_id":id, "arguments":arguments,
+async fn call_center(
+    client: &StdioClient,
+    route: &CenterRoute,
+    arguments: Value,
+    call_id: &str,
+    stale: impl Fn() -> bool,
+) -> Result<Value> {
+    let mut request = json!({"name":"enzui_call","arguments":{
+        "app_id":route.app, "function_id":route.id, "arguments":arguments,
     }});
+    request["arguments"]["expected_manifest"] = json!(route.manifest);
+    if !call_id.is_empty() && route.function["risk"] != "read_only" {
+        request["arguments"]["idempotency_key"] = json!(crate::sha256_hex(call_id.as_bytes()));
+    }
     // Matches the MCP Center's longest call so the user has time to read the consent dialog.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
+        if stale() {
+            return fail(crate::runtime::STEERED);
+        }
         let reply = client.request("tools/call", request.clone()).await?;
         match center_result(&reply) {
             Err(error) if error.0 == "center-approval-pending" => {
@@ -708,7 +957,14 @@ async fn call_center(client: &StdioClient, app: &str, id: &str, arguments: Value
                 }
                 tokio::time::sleep(Duration::from_millis(750)).await;
             }
-            result => return result.map(|mut value| value["result"].take()),
+            result => {
+                return result.and_then(|mut value| {
+                    if value["app_id"] != route.app || value["function_id"] != route.id {
+                        return fail(CENTER_CHANGED);
+                    }
+                    Ok(value["result"].take())
+                });
+            }
         }
     }
 }

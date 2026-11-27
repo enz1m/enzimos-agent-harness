@@ -12,6 +12,8 @@ pub(crate) const LOCKED: &str = "The desktop is locked.";
 pub(crate) const UNAVAILABLE: &str = "This control or reading is unavailable on this desktop.";
 pub(crate) const TIMER_LIMIT: &str = "The desktop timer limit has been reached.";
 pub(crate) const APP_UNAVAILABLE: &str = "No unique installed app matched that name.";
+pub(crate) const APP_LAUNCH_FAILED: &str = "The app is installed but could not be started.";
+pub(crate) const APP_RESTRICTED: &str = "This account cannot launch the requested app.";
 pub(crate) const FOLDER_UNAVAILABLE: &str = "That folder is unavailable.";
 pub(crate) const NO_BACKLIGHT: &str = "No controllable screen backlight was found.";
 
@@ -611,6 +613,8 @@ pub(crate) async fn invoke(tool: Tool, arguments: Value) -> Result<Value> {
         Some("limit") => TIMER_LIMIT,
         Some("app") => APP_UNAVAILABLE,
         Some("folder") => FOLDER_UNAVAILABLE,
+        Some("launch") => APP_LAUNCH_FAILED,
+        Some("restricted") => APP_RESTRICTED,
         Some("no_backlight") => NO_BACKLIGHT,
         _ => desktop::INVALID,
     })

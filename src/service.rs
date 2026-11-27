@@ -832,20 +832,45 @@ impl Service {
     }
 
     async fn warmup(&self, request: &Value) -> Result<Value> {
-        let (provider, model) =
-            if let Some(id) = request.get("session_id").filter(|id| !id.is_null()) {
-                let id = session_id(id)?;
-                let saved = self.stored(&json!(id))?;
-                (saved["provider"].clone(), saved["model"].clone())
-            } else {
-                (
-                    self.config
-                        .get("default_provider")
-                        .cloned()
-                        .unwrap_or(json!("local")),
-                    self.config["enzui"]["model"].clone(),
-                )
-            };
+        let saved = if let Some(id) = request.get("session_id").filter(|id| !id.is_null()) {
+            self.stored(id)?
+        } else if request.is_null() {
+            self.saved_list()
+                .ok()
+                .as_ref()
+                .and_then(Value::as_array)
+                .and_then(|rows| rows.iter().max_by_key(|row| row["updated"].as_u64()))
+                .and_then(|row| self.stored(&row["id"]).ok())
+                .unwrap_or_default()
+        } else {
+            Value::Null
+        };
+        if request.is_null() && saved.is_null() {
+            return Ok(json!({"warmed": false}));
+        }
+        let provider = saved
+            .get("provider")
+            .or_else(|| request.get("provider").filter(|v| v.is_string()))
+            .or_else(|| self.config.get("default_provider"))
+            .and_then(Value::as_str)
+            .unwrap_or("local");
+        let model = saved
+            .get("model")
+            .or_else(|| request.get("model").filter(|v| v.is_string()))
+            .unwrap_or_else(|| &self.config["enzui"]["model"]);
+        let draft = request["draft"]
+            .as_str()
+            .filter(|draft| draft.len() <= 4096);
+        let previous_prompt = saved["messages"]
+            .as_array()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "user")
+            })
+            .and_then(|message| message["content"].as_str());
+        let prompt = draft.or(previous_prompt).unwrap_or_default();
         if provider != "local" || self.active.get() != 0 {
             return Ok(json!({"warmed": false}));
         }
@@ -857,17 +882,24 @@ impl Service {
         } else {
             crate::local::pick_model(
                 &gateway.local_models().await?,
-                crate::local::Task::Text,
+                crate::local::Task::classify(prompt, false),
                 false,
             )
         };
         let mcp = Mcp::new(json!({}))?;
         if !crate::device::legacy_enabled() {
-            let _ = mcp.start_center(false).await;
+            let _ = mcp.start_center(prompt, None).await;
         }
-        let prefix = model
-            .as_deref()
-            .and_then(|model| runtime::static_prefix(model, &mcp.schemas.borrow()));
+        let instructions = format!("{} {BASE_INSTRUCTIONS}", crate::local::DESKTOP_CONTEXT);
+        let prefix = model.as_deref().and_then(|model| {
+            runtime::static_prefix(
+                model,
+                prompt,
+                &mcp.schemas.borrow(),
+                &instructions,
+                self.scratch.is_some(),
+            )
+        });
         mcp.close().await;
         if self.active.get() != 0 {
             return Ok(json!({"warmed": false}));
@@ -1000,12 +1032,12 @@ impl Service {
                     let configured = !mcp.schemas.borrow().is_empty();
                     if verified_desktop && !crate::device::legacy_enabled() {
                         let start = std::time::Instant::now();
-                        let _ = mcp
-                            .start_center(crate::local::Task::uses_browser(&prompt))
-                            .await;
+                        let workspace = session.borrow().workspace.read_binding();
+                        let _ = mcp.start_center(&prompt, workspace).await;
                         crate::timing::phase(&session_id, "discover_center", start);
                     }
-                    let active = (!mcp.schemas.borrow().is_empty()).then_some(&*mcp);
+                    let active =
+                        (verified_desktop || !mcp.schemas.borrow().is_empty()).then_some(&*mcp);
                     let (automatic, task, screenshots) = {
                         let session = session.borrow();
                         let task = if selected.is_empty() && !configured {
@@ -1090,6 +1122,7 @@ impl Service {
                             attachments,
                             replace,
                             verified_desktop,
+                            compact_tools: verified_desktop && selected.is_empty() && !configured,
                             context_tokens,
                         },
                     )
@@ -1221,7 +1254,13 @@ impl Service {
             }
             let assistant = matches!(
                 request["method"].as_str(),
-                Some("turn.start" | "turn.revise" | "turn.steer" | "approval.resolve")
+                Some(
+                    "turn.start"
+                        | "turn.revise"
+                        | "turn.steer"
+                        | "approval.resolve"
+                        | "model.warmup"
+                )
             )
             .then(|| desktop::ShellPeer::assistant(reader.get_ref()))
             .flatten();
@@ -1258,6 +1297,10 @@ impl Service {
                 desktop::exchange(session, generation, reader, &mut writer, peer, commands).await;
                 Ok(())
             } else if request["method"] == "model.warmup" {
+                if assistant.is_none() && ["provider", "model", "draft"].iter()
+                    .any(|key| request.get(key).is_some_and(|value| !value.is_null())) {
+                    return fail(desktop::UNAVAILABLE);
+                }
                 let result = tokio::select! {
                     _ = reader.read_u8() => return Ok(()),
                     result = tokio::time::timeout(Duration::from_secs(45), self.warmup(&request)) => {
@@ -1286,6 +1329,8 @@ impl Service {
                 | GATEWAY_UNAVAILABLE
                 | LOCAL_MODELS_UNAVAILABLE
                 | PROVIDER_TIMEOUT
+                | crate::provider::MODEL_OUT_OF_MEMORY
+                | crate::provider::MODEL_UNSUPPORTED
                 | crate::screenshot::ACCESS_OFF
                 | crate::screenshot::VISION_REQUIRED
                 | crate::attachment::INVALID

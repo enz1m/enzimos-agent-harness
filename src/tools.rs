@@ -201,6 +201,14 @@ impl Workspace {
         })
     }
 
+    pub(crate) fn read_binding(&self) -> Option<Value> {
+        self.exclusions.is_empty().then(|| {
+            json!({
+                "path":self.path, "device":self.identity.0, "inode":self.identity.1
+            })
+        })
+    }
+
     fn excluded(&self, parts: &[&str]) -> bool {
         self.exclusions.iter().any(|prefix| {
             parts.len() >= prefix.len()
