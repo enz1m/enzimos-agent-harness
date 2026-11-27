@@ -816,16 +816,9 @@ impl Service {
         let Some(gateway) = &self.gateway else {
             return Ok(json!({"warmed": false}));
         };
-        let model = match model.as_str().filter(|name| !name.is_empty()) {
-            Some(name) => name.to_owned(),
-            None => crate::local::pick_model(
-                &gateway.local_models().await?,
-                crate::local::Task::Text,
-                false,
-            )
-            .ok_or_else(|| ToolError(crate::provider::LOCAL_MODELS_UNAVAILABLE.into()))?,
-        };
-        gateway.warmup(&model).await
+        gateway
+            .warmup(model.as_str().filter(|name| !name.is_empty()))
+            .await
     }
 
     async fn send(writer: &mut OwnedWriteHalf, body: &Value) -> Result<()> {

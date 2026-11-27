@@ -341,9 +341,13 @@ impl Gateway {
             .map_err(|_| ToolError(PROVIDER_TIMEOUT.into()))?
     }
 
-    pub(crate) async fn warmup(&self, model: &str) -> Result<Value> {
+    pub(crate) async fn warmup(&self, model: Option<&str>) -> Result<Value> {
         let (reader, mut writer) = self.connect().await?.into_split();
-        let body = json!({"provider": "local", "model": model}).to_string();
+        let mut body = json!({"provider": "local"});
+        if let Some(model) = model {
+            body["model"] = json!(model);
+        }
+        let body = body.to_string();
         let request = format!(
             "POST /v1/models/warmup HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
