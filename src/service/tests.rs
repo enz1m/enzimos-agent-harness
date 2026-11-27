@@ -667,3 +667,60 @@ async fn turn_failures_expose_only_actionable_provider_errors() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn revising_keeps_attachments_and_preserves_the_saved_reply_on_failure() {
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let complete: Complete = {
+                let seen = seen.clone();
+                Rc::new(move |body, _| {
+                    let mut seen = seen.borrow_mut();
+                    seen.push(body);
+                    let result = match seen.len() {
+                        1 => Ok(runtime::assistant("first answer", vec![])),
+                        2 => fail(crate::provider::PROVIDER_TIMEOUT),
+                        _ => Ok(runtime::assistant("revised answer", vec![])),
+                    };
+                    Box::pin(async move { result })
+                })
+            };
+            let fixture = start_with(json!({}), complete).await;
+            let id = session(&fixture).await;
+            let start = request(&fixture.socket, json!({
+                "method": "turn.start", "session_id": id, "prompt": "Show the room",
+                "attachments": [{"name": "agenda.txt", "text": "Room K42"}]
+            })).await;
+            let revision = start.iter().find(|f| f["event"]["type"] == "turn.completed").unwrap()["event"]["sequence"].clone();
+            let revise = |expected: Value| json!({
+                "method": "turn.revise", "session_id": id, "prompt": "Give the room in one word",
+                "expected_revision": expected
+            });
+            let export = json!({"method": "session.export", "session_id": id, "items_only": true});
+            let stale = request(&fixture.socket, revise(json!(0))).await;
+            assert_eq!(stale[0]["error"], "stale-turn-revision");
+            let failed = request(&fixture.socket, revise(revision.clone())).await;
+            assert_eq!(failed.last().unwrap()["error"], crate::provider::PROVIDER_TIMEOUT);
+            let saved = request(&fixture.socket, export.clone()).await;
+            assert_eq!(saved[0]["result"]["items"][1]["text"], "first answer");
+            assert_eq!(saved[0]["result"]["last_turn_revision"], revision);
+
+            let revised = request(&fixture.socket, revise(revision.clone())).await;
+            assert_eq!(revised.last().unwrap()["ok"], true);
+            let saved = request(&fixture.socket, export).await;
+            let items = saved[0]["result"]["items"].as_array().unwrap();
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0]["text"], "Give the room in one word");
+            assert_eq!(items[0]["attachments"], json!(["agenda.txt"]));
+            assert_eq!(items[1]["text"], "revised answer");
+            assert_ne!(saved[0]["result"]["last_turn_revision"], revision);
+            let seen = seen.borrow();
+            let messages = seen[2]["messages"].as_array().unwrap();
+            let users: Vec<_> = messages.iter().filter(|message| message["role"] == "user").collect();
+            assert_eq!(users.len(), 1);
+            assert!(users[0]["content"].as_str().unwrap().contains("Room K42"));
+            assert!(users[0].get("attachments").is_none());
+        })
+        .await;
+}

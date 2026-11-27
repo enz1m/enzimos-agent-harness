@@ -126,12 +126,30 @@ fn saved_title(body: &Value) -> Option<String> {
         .map(|title| title.chars().take(60).collect())
 }
 
+fn last_revision(body: &Value, messages: &[Value]) -> Option<u64> {
+    if let Some(revision) = body.get("last_turn_revision") {
+        return revision.as_u64();
+    }
+    let last = messages.last()?;
+    if last["role"] == "assistant"
+        && last["tool_calls"].is_null()
+        && last["content"]
+            .as_str()
+            .is_some_and(|text| !text.trim().is_empty())
+    {
+        body["last_sequence"].as_u64()
+    } else {
+        None
+    }
+}
+
 fn items(messages: &[Value]) -> Vec<Value> {
     let mut items = Vec::new();
     let mut calls: HashMap<String, usize> = HashMap::new();
     for message in messages {
         match message["role"].as_str().unwrap_or_default() {
-            "user" => items.push(json!({"kind": "user", "text": message["content"]})),
+            "user" => items.push(json!({"kind": "user", "text": message["content"],
+                "attachments": crate::attachment::names(message)})),
             "assistant" => {
                 if let Some(text) = message["content"].as_str().filter(|t| !t.is_empty()) {
                     items.push(json!({"kind": "assistant", "text": text}));
@@ -309,7 +327,7 @@ impl Service {
 
     fn save(&self, session: &Session) -> Result<()> {
         let body = json!({"schema_version": 1, "id": session.id, "workspace": session.workspace.path, "provider": session.provider, "model": session.model,
-            "approval_mode": session.approval_mode.saved(), "title": session.title, "messages": session.messages, "last_sequence": session.sequence, "profile": session.profile});
+            "approval_mode": session.approval_mode.saved(), "title": session.title, "messages": session.messages, "last_turn_revision": session.last_turn_revision, "last_sequence": session.sequence, "profile": session.profile});
         let raw = body.to_string();
         if raw.len() > 2 * MAX_FRAME {
             return fail("session state exceeds limit");
@@ -583,6 +601,7 @@ impl Service {
             s.messages = complete[..boundary].to_vec();
             s.title = saved_title(&body).or_else(|| headline(&s.messages).0);
             s.sequence = sequence;
+            s.last_turn_revision = last_revision(&body, &s.messages);
             self.save(&s)?;
         }
         let approval_mode = session.borrow().approval_mode.wire();
@@ -612,7 +631,11 @@ impl Service {
                 let mut body = self.stored(&request["session_id"])?;
                 let messages = body["messages"].as_array().map_or(&[][..], Vec::as_slice);
                 let (items, (title, _)) = (items(messages), headline(messages));
+                body["last_turn_revision"] = json!(last_revision(&body, messages));
                 body["items"] = json!(items);
+                if request["items_only"] == true {
+                    body.as_object_mut().unwrap().remove("messages");
+                }
                 body["title"] = json!(saved_title(&body).or(title));
                 return Ok(body);
             }
@@ -777,6 +800,40 @@ impl Service {
         if Access::parse(request.get("screenshots"))? != session.borrow().screenshots {
             return fail("screenshot access changed; reopen the conversation");
         }
+        let (prompt, attachments, replace, previous) = {
+            let state = session.borrow();
+            if request["method"] == "turn.revise" {
+                let index = state
+                    .messages
+                    .iter()
+                    .rposition(|m| m["role"] == "user")
+                    .ok_or_else(|| ToolError("stale-turn-revision".into()))?;
+                let revision = state
+                    .last_turn_revision
+                    .filter(|revision| request["expected_revision"].as_u64() == Some(*revision))
+                    .ok_or_else(|| ToolError("stale-turn-revision".into()))?;
+                let previous = &state.messages[index];
+                let prompt = request
+                    .get("prompt")
+                    .unwrap_or(&previous["content"])
+                    .as_str()
+                    .filter(|text| !text.trim().is_empty())
+                    .ok_or_else(|| ToolError("Enter a message to send.".into()))?;
+                (
+                    prompt.to_owned(),
+                    crate::attachment::validate(previous.get("attachments"))?,
+                    Some(index),
+                    Some((state.messages.clone(), revision)),
+                )
+            } else {
+                (
+                    Self::text(request, "prompt")?.to_owned(),
+                    crate::attachment::validate(request.get("attachments"))?,
+                    None,
+                    None,
+                )
+            }
+        };
         // Fallible setup runs before the session is marked busy.
         let mcp = Rc::new(Mcp::new(
             self.config.get("mcp_servers").cloned().unwrap_or(json!({})),
@@ -815,14 +872,13 @@ impl Service {
                         return fail("selected skills exceed context limit");
                     }
                     mcp.start().await?;
-                    let prompt = request["prompt"]
-                        .as_str()
-                        .ok_or_else(|| ToolError("invalid turn input".into()))?;
                     let active = (!mcp.schemas.borrow().is_empty()).then_some(&*mcp);
                     let (automatic, task, screenshots) = {
                         let session = session.borrow();
                         let task = if selected.is_empty() && active.is_none() {
-                            crate::local::Task::from_turn(prompt, &session.messages)
+                            let history = replace
+                                .map_or(session.messages.as_slice(), |i| &session.messages[..i]);
+                            crate::local::Task::from_turn(&prompt, history)
                         } else {
                             crate::local::Task::Full
                         };
@@ -832,23 +888,35 @@ impl Service {
                             session.screenshots,
                         )
                     };
+                    let has_images = crate::attachment::has_images(&attachments);
                     let model = if automatic {
-                        let gateway = service
-                            .gateway
-                            .as_ref()
-                            .ok_or_else(|| ToolError(crate::provider::LOCAL_MODELS_UNAVAILABLE.into()))?;
+                        let gateway = service.gateway.as_ref().ok_or_else(|| {
+                            ToolError(crate::provider::LOCAL_MODELS_UNAVAILABLE.into())
+                        })?;
                         crate::local::pick_model(
                             &gateway.local_models().await?,
                             task,
-                            screenshots != Access::Off,
+                            has_images || screenshots != Access::Off,
                         )
-                        .ok_or_else(|| ToolError(crate::provider::LOCAL_MODELS_UNAVAILABLE.into()))?
+                        .ok_or_else(|| {
+                            ToolError(crate::provider::LOCAL_MODELS_UNAVAILABLE.into())
+                        })?
                     } else {
                         session.borrow().model.clone()
                     };
+                    if has_images
+                        && (automatic
+                            || crate::local::Profile::is_builtin(
+                                &session.borrow().provider,
+                                &model,
+                            ))
+                        && model != crate::local::Profile::VISION_MODEL
+                    {
+                        return fail(crate::attachment::VISION_REQUIRED);
+                    }
                     runtime::run_configured(
                         &session,
-                        prompt,
+                        &prompt,
                         &service.complete,
                         active,
                         8,
@@ -856,9 +924,18 @@ impl Service {
                             instructions: Some(&instructions),
                             model: &model,
                             task,
+                            attachments,
+                            replace,
                         },
                     )
                     .await
+                    .map_err(|error| {
+                        if has_images && error.0 == crate::provider::IMAGE_REJECTED {
+                            ToolError(crate::attachment::VISION_REQUIRED.into())
+                        } else {
+                            error
+                        }
+                    })
                 };
                 tokio::time::timeout(Duration::from_secs(600), work)
                     .await
@@ -899,7 +976,24 @@ impl Service {
         }
         self.active.set(self.active.get() - 1);
         self.busy.borrow_mut().remove(&id);
-        self.save(&session.borrow())?;
+        let restore = |messages, revision| {
+            let mut s = session.borrow_mut();
+            s.messages = messages;
+            s.last_turn_revision = Some(revision);
+        };
+        if let Some((messages, revision)) = previous {
+            if matches!(&outcome, Some(Ok(Ok(())))) {
+                let saved = self.save(&session.borrow());
+                if saved.is_err() {
+                    restore(messages, revision);
+                }
+                saved?;
+            } else {
+                restore(messages, revision);
+            }
+        } else {
+            self.save(&session.borrow())?;
+        }
         match outcome {
             None => Ok(()),
             Some(Err(join)) if join.is_cancelled() => {
@@ -992,7 +1086,10 @@ impl Service {
                 Self::send(&mut writer, &json!({"ok":true, "generation":generation})).await?;
                 desktop::exchange(session, generation, reader, &mut writer, peer, commands).await;
                 Ok(())
-            } else if request["method"] == "turn.start" {
+            } else if matches!(
+                request["method"].as_str(),
+                Some("turn.start" | "turn.revise")
+            ) {
                 self.turn(&request, &mut reader, &mut writer).await
             } else {
                 let result = self.dispatch(&request)?;
@@ -1002,9 +1099,18 @@ impl Service {
         .await;
         if let Err(error) = result {
             // Only reasons a client can act on are distinguished.
-            use crate::provider::{GATEWAY_UNAVAILABLE, LOCAL_MODELS_UNAVAILABLE, PROVIDER_TIMEOUT};
+            use crate::provider::{
+                GATEWAY_UNAVAILABLE, LOCAL_MODELS_UNAVAILABLE, PROVIDER_TIMEOUT,
+            };
             let code = match error.0.as_str() {
-                Skills::CHANGED | GATEWAY_UNAVAILABLE | LOCAL_MODELS_UNAVAILABLE | PROVIDER_TIMEOUT => error.0.as_str(),
+                Skills::CHANGED
+                | GATEWAY_UNAVAILABLE
+                | LOCAL_MODELS_UNAVAILABLE
+                | PROVIDER_TIMEOUT
+                | crate::attachment::INVALID
+                | crate::attachment::VISION_REQUIRED
+                | "local-context-limit"
+                | "stale-turn-revision" => error.0.as_str(),
                 _ => "request-unavailable",
             };
             let _ = Self::send(&mut writer, &json!({"ok": false, "error": code})).await;

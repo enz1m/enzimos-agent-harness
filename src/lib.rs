@@ -2,6 +2,7 @@
 //! Native per-user agent sessions and tool harness. Model execution stays in
 //! enzimos-inference-service and provider routing in enzimos-ai-gateway; the
 //! shell owns presentation.
+mod attachment;
 mod desktop;
 pub mod http_mcp;
 mod local;

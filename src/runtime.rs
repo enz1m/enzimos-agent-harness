@@ -245,6 +245,7 @@ pub struct Session {
     pub profile: String,
     pub workspace: Workspace,
     pub messages: Vec<Value>,
+    pub(crate) last_turn_revision: Option<u64>,
     pub events: VecDeque<Value>,
     event_sizes: VecDeque<usize>,
     event_bytes: usize,
@@ -283,6 +284,7 @@ impl Session {
             profile: profile.into(),
             workspace,
             messages: vec![],
+            last_turn_revision: None,
             events: VecDeque::new(),
             event_sizes: VecDeque::new(),
             event_bytes: 0,
@@ -687,6 +689,8 @@ pub async fn run(
             instructions,
             model: &model,
             task: Task::Full,
+            attachments: Vec::new(),
+            replace: None,
         },
     )
     .await
@@ -740,6 +744,8 @@ pub(crate) struct TurnProfile<'a> {
     pub(crate) instructions: Option<&'a str>,
     pub(crate) model: &'a str,
     pub(crate) task: Task,
+    pub(crate) attachments: Vec<Value>,
+    pub(crate) replace: Option<usize>,
 }
 
 pub(crate) async fn run_configured(
@@ -752,6 +758,8 @@ pub(crate) async fn run_configured(
         instructions,
         model,
         task,
+        attachments,
+        replace,
     }: TurnProfile<'_>,
 ) -> Result<()> {
     if session.borrow().turn_id.is_some() {
@@ -780,7 +788,14 @@ pub(crate) async fn run_configured(
     {
         let mut s = session.borrow_mut();
         let mut messages = s.messages.clone();
-        messages.push(json!({"role": "user", "content": prompt}));
+        if let Some(index) = replace {
+            messages.truncate(index);
+        }
+        let mut user = json!({"role": "user", "content": prompt});
+        if !attachments.is_empty() {
+            user["attachments"] = json!(attachments);
+        }
+        messages.push(user);
         trim(&mut messages, CONTEXT_LIMIT);
         if size(&messages) > CONTEXT_LIMIT {
             return fail("session context exceeds limit");
@@ -789,9 +804,13 @@ pub(crate) async fn run_configured(
             s.title = crate::service::headline(&messages).0;
         }
         s.messages = messages;
+        s.last_turn_revision = None;
         s.last_active = Instant::now();
         s.turn_id = Some(token());
-        s.emit("turn.started", json!({"model": model}));
+        s.emit(
+            "turn.started",
+            json!({"model": model, "replacing": replace.is_some()}),
+        );
     }
     let mut guard = TurnGuard {
         session: session.clone(),
@@ -843,14 +862,30 @@ pub(crate) async fn run_configured(
             if desktop_generation.is_some() {
                 tools.extend(desktop::schemas());
             }
+            let active_user = messages.iter().rposition(|m| m["role"] == "user");
+            let mut visual_content = None;
+            for (index, message) in messages.iter_mut().enumerate() {
+                let active = Some(index) == active_user;
+                crate::attachment::provider_message(message, active);
+                if active && message["content"].is_array() {
+                    let parts = message["content"].as_array().unwrap();
+                    visual_content = Some(message["content"].clone());
+                    message["content"] = parts[0]["text"].clone();
+                }
+            }
             if local.is_some() {
                 let overhead = instructions.map_or(0, str::len) + size(&tools);
                 let limit = Profile::MESSAGE_BYTES.saturating_sub(overhead);
                 trim(&mut messages, limit);
                 if size(&messages) > limit {
                     incomplete = true;
-                    return fail("local model context exceeded");
+                    return fail("local-context-limit");
                 }
+            }
+            if let Some(content) = visual_content
+                && let Some(user) = messages.iter_mut().rev().find(|m| m["role"] == "user")
+            {
+                user["content"] = content;
             }
             if let Some(instructions) = instructions.filter(|i| !i.is_empty()) {
                 messages.insert(0, json!({"role": "system", "content": instructions}));
@@ -1020,13 +1055,15 @@ pub(crate) async fn run_configured(
     };
     let mut s = session.borrow_mut();
     close_batch(&mut s.messages);
+
     if known_local && incomplete {
         s.emit("turn.local_limit", json!({}));
     }
-    s.emit(
+    let completed = s.emit(
         "turn.completed",
         json!({"status": status, "duration_ms": guard.started.elapsed().as_millis() as u64}),
     );
+    s.last_turn_revision = completed["sequence"].as_u64().filter(|_| result.is_ok());
     drop(s);
     result
 }
@@ -1201,6 +1238,8 @@ mod transcript_tests {
                 instructions: None,
                 model: "minicpm5-1b",
                 task: Task::Write,
+                attachments: Vec::new(),
+                replace: None,
             },
         )
         .await

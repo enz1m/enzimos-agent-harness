@@ -62,10 +62,19 @@ Additional `protected_paths` may contain up to32 absolute paths.
   current policy/provider/workspace and discards incomplete tool batches.
 - `session.export`, `session.delete`: session_id. An export adds `title` and
   `items`: the transcript as a client shows it (`user`, `assistant` and `tool`
-  records with tool, arguments, output and status). Delete requires a closed session.
-  Stored transcripts are sensitive, bounded2MiB each, at most128 sessions.
+  records with tool, arguments, output and status). User items list attachment
+  names. Send `items_only: true` to omit the raw messages. The export also
+  returns `last_turn_revision` for the latest successful turn when available.
+  Delete requires a closed session. Stored transcripts are sensitive,
+  including the bytes of any attached documents and images. Each transcript
+  is bounded to 2 MiB, with at most 128 sessions.
 - `session.close`: session_id; cancel a running turn first.
 - `turn.start`: session_id, prompt, and optional `skills: [{name, sha256}]` (max8).
+  The optional `attachments` array accepts up to three entries, each with a
+  `name` and either `text` (4 KiB total) or `jpeg` (base64, at most 128 KiB
+  encoded and 768 pixels on either side). File loading and PDF text extraction
+  happen in the client. The active turn passes images to a vision model.
+  Later turns retain document text and image names as context.
   Supply the current approval_mode when Full send is active and the current
   screenshots setting when enabled. If supplied, both settings must match.
   Events include turn and tool lifecycle, approval requests and resolutions, and
@@ -74,6 +83,12 @@ Additional `protected_paths` may contain up to32 absolute paths.
   Replies are streamed: `reasoning.delta` and `message.delta` carry `text` as it
   arrives, `reasoning.completed` carries `duration_ms`, and `message.completed`
   carries the whole `content`.
+- `turn.revise`: session_id, expected_revision, optional prompt, and the same
+  approval and screenshot settings as `turn.start`. Use the sequence of the
+  successful `turn.completed` event or the export's `last_turn_revision`.
+  The original prompt is reused when omitted. The last user message and its
+  reply are replaced on success, preserving its attachments. A stopped or
+  failed revision preserves the original transcript.
 - `turn.steer`: session_id, text. Queues a user message into the running turn; the
   model reads it before its next step (`steer.accepted` with `text`), and a turn
   that was ending takes another step to answer it. At most8 queued; refused when
