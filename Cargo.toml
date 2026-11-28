@@ -11,7 +11,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 iana-time-zone = "0.1"
 html5ever = "0.39"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
-enzimos-platform = { git = "https://github.com/enz1m/enzimos-packages.git", rev = "cfe4292cf83f8987f757c4f411a646e64722003a" }
+enzimos-platform = { git = "https://github.com/enz1m/enzimos-packages.git", rev = "bfbc46409befb5bbd67e766a1175f6b0a94774d7" }
 serde_json = "1"
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false }
