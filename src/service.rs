@@ -354,7 +354,7 @@ impl Service {
 
     fn save(&self, session: &Session) -> Result<()> {
         let body = json!({"schema_version": 1, "id": session.id, "workspace": session.workspace.path, "provider": session.provider, "model": session.model,
-            "approval_mode": session.approval_mode.saved(), "title": session.title, "messages": session.messages, "last_turn_revision": session.last_turn_revision, "last_sequence": session.sequence, "profile": session.profile});
+            "approval_mode": session.approval_mode.saved(), "title": session.title, "messages": session.messages, "last_turn_revision": session.last_turn_revision, "last_sequence": session.sequence, "profile": session.profile, "voice_receipts": session.speech.receipts()});
         self.write_saved(&session.id, &body)
     }
 
@@ -633,6 +633,7 @@ impl Service {
             s.title = saved_title(&body).or_else(|| headline(&s.messages).0);
             s.sequence = sequence;
             s.last_turn_revision = last_revision(&body, &s.messages);
+            s.speech.restore(&body["voice_receipts"]);
             self.save(&s)?;
         }
         let approval_mode = session.borrow().approval_mode.wire();
@@ -813,8 +814,27 @@ impl Service {
                 if !assistant && session.borrow().verified_desktop_turn {
                     return fail(desktop::UNAVAILABLE);
                 }
-                session.borrow_mut().steer(Self::text(request, "text")?)?;
+                let mut state = session.borrow_mut();
+                if let Some(turn_id) = request.get("turn_id")
+                    && !state.turn_id.as_deref().is_some_and(|id| turn_id == id)
+                {
+                    return fail("stale steering turn");
+                }
+                state.steer(Self::text(request, "text")?)?;
                 Ok(json!({"steered": true}))
+            }
+            "voice.ack" => {
+                if !assistant {
+                    return fail(desktop::UNAVAILABLE);
+                }
+                let mut state = session.borrow_mut();
+                if !state.speech.acknowledge(request) {
+                    return fail("invalid speech receipt");
+                }
+                if !self.busy.borrow().contains(id) {
+                    self.save(&state)?;
+                }
+                Ok(json!({"recorded": true}))
             }
             "turn.cancel" => {
                 session.borrow().cancel();
@@ -936,6 +956,7 @@ impl Service {
         }) else {
             return fail("session unavailable or service busy");
         };
+        let modality = crate::voice::Modality::parse(request.get("modality"))?;
         let active_mode = session.borrow().approval_mode;
         match request.get("approval_mode") {
             Some(mode) if ApprovalMode::parse(mode)? == active_mode => {}
@@ -1124,6 +1145,7 @@ impl Service {
                             verified_desktop,
                             compact_tools: verified_desktop && selected.is_empty() && !configured,
                             context_tokens,
+                            modality,
                         },
                     )
                     .await
@@ -1258,6 +1280,7 @@ impl Service {
                     "turn.start"
                         | "turn.revise"
                         | "turn.steer"
+                        | "voice.ack"
                         | "approval.resolve"
                         | "model.warmup"
                 )

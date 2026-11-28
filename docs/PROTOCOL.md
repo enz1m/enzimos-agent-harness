@@ -51,6 +51,45 @@ under `XDG_CACHE_HOME`. The harness sweeps files older than 24 hours at startup
 and every 30 minutes. `command` can use the scratch directory with
 `scratch: true`, with the same sandbox and review policy as workspace commands.
 
+An explicitly configured public MCP tool can supply preliminary voice facts.
+Under its entry in `mcp_servers`, configure a projection such as:
+
+```json
+"public_voice_progress": {
+  "tool": "lookup",
+  "subjects": {"juniper": "Juniper Cafe"},
+  "facts": [
+    {"field": "open_now", "when_true": "is open", "when_false": "is closed"},
+    {"field": "vegetarian_lunch", "when_true": "serves a vegetarian lunch"}
+  ]
+}
+```
+
+Use this with a public data source you trust to verify its claims. The tool
+returns a matching `structuredContent.subject_id` and checked Boolean values
+for the configured fields. Unknown fields may be null or absent. The harness
+selects up to two matching phrases in configuration order. A label or phrase
+takes up to 64 bytes of letters, spaces, apostrophes or hyphens. The rendered
+sentence stays under 121 bytes. The harness speaks only configured words,
+even if the tool sends text or additional fields. Managed extensions cannot
+enable this projection.
+
+In a voice turn, the built-in web fetch can report a preliminary fact
+during a follow-up fetch to a different host. It uses a single self-identifying
+Schema.org food-establishment record from an anonymous, query-free HTTPS home
+page served without a private or no-store cache directive. The
+record's name must match the host label and occur in the fetched text excerpt.
+The current question selects a supported reservation or cuisine fact. The
+harness renders it as a claim from the website, with fixed wording and no
+ratings, availability inference, or extra requests. The tool result includes
+the attributed `site_statement` for the regular answer. Configured public
+MCP facts take precedence.
+
+Other pages can report reachability from the fetched HTTP response. The
+built-in clock can report the observed time. Arbitrary tool text, file
+contents, unconfigured connectors and unrecognized subject IDs receive a
+generic update.
+
 ## Sessions and turns
 
 - `session.create`: workspace, model, optional provider, profile, approval_mode
@@ -110,17 +149,34 @@ and every 30 minutes. `command` can use the scratch directory with
   local context, output, or tool-loop limit, or a malformed or empty completion.
   Replies are streamed: `reasoning.delta` and `message.delta` carry `text` as it
   arrives, `reasoning.completed` carries `duration_ms`, and `message.completed`
-  carries the whole `content`.
+  carries the whole `content`. Set `modality` to `voice` for spoken interaction
+  or to `text` for ordinary chat. Omitting it uses text. Both use the same
+  JSON transport, model selection and approval policy. Voice adds spoken
+  delivery instructions to the provider’s system message. A text transport
+  can explicitly request voice behavior for evaluation.
+  `voice.speech` carries `turn_id`, `sequence`, `kind` (`progress` or `final`)
+  and bounded `text` for the player. It has no audio payload. A progress event
+  can occur once while a tool is still running, independently of generation.
+  The timer targets 35 seconds into the turn and requires at least eight
+  seconds in the active tool. Progress uses checked facts from supported
+  tools and otherwise uses a generic status. Completion is reported by the existing `turn.completed` event.
 - `turn.revise`: session_id, expected_revision, optional prompt, and the same
-  approval and screenshot settings as `turn.start`. Use the sequence of the
+  approval, modality and screenshot settings as `turn.start`. Use the sequence of the
   successful `turn.completed` event or the export's `last_turn_revision`.
   The original prompt is reused when omitted. The last user message and its
   reply are replaced on success, preserving its attachments. A stopped or
   failed revision preserves the original transcript.
-- `turn.steer`: session_id, text. Queues a user message into the running turn; the
-  model reads it before its next step (`steer.accepted` with `text`), and a turn
-  that was ending takes another step to answer it. At most8 queued; refused when
-  no turn is running.
+- `turn.steer`: session_id, text and optional turn_id. A supplied turn_id must
+  match the active turn. The model reads the correction at the next step
+  (`steer.accepted`), with any completed results. Up to eight corrections may
+  be queued.
+- `voice.ack`: session_id, turn_id, sequence and status (`played`,
+  `interrupted` or `discarded`). The verified Assistant peer acknowledges
+  each offered clip once. The exact played progress is inserted as assistant
+  history in the active turn’s subsequent model rounds. The next round can
+  wait up to eight seconds for a pending receipt from the verified Assistant.
+  Active tools continue running independently. Session records retain the last twelve delivery
+  receipts in sequence order.
 - `turn.cancel`: session_id. Disconnect also cancels pending approval/execution.
 - `events.list`: session_id, after sequence; returns events, last_sequence, `gap`
   when the bounded512-event/2MiB ring no longer contains the requested history,

@@ -18,6 +18,7 @@ pub mod service;
 pub mod skills;
 mod timing;
 pub mod tools;
+mod voice;
 mod web_fetch;
 
 /// Internal refusal; callers only see generic codes.

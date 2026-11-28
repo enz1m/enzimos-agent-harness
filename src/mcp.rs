@@ -268,6 +268,7 @@ pub struct Mcp {
     pub(crate) center_availability: RefCell<Vec<Value>>,
     workspace_read: RefCell<Option<Value>>,
     approval_identities: RefCell<BTreeMap<String, String>>,
+    public_voice_progress: RefCell<BTreeMap<String, Value>>,
 }
 
 pub(crate) fn server_name(name: &str) -> bool {
@@ -300,11 +301,16 @@ impl Mcp {
             center_availability: RefCell::default(),
             workspace_read: RefCell::default(),
             approval_identities: RefCell::default(),
+            public_voice_progress: RefCell::default(),
         })
     }
 
     pub fn has(&self, alias: &str) -> bool {
         self.routes.borrow().contains_key(alias) || self.uses_center(alias)
+    }
+
+    pub(crate) fn public_voice_progress(&self, alias: &str) -> Option<Value> {
+        self.public_voice_progress.borrow().get(alias).cloned()
     }
 
     pub(crate) fn uses_center(&self, alias: &str) -> bool {
@@ -675,6 +681,16 @@ impl Mcp {
             self.approval_identities
                 .borrow_mut()
                 .insert(alias.clone(), format!("mcp:{identity}"));
+            let lookup = &config["public_voice_progress"];
+            if config["managed"] != true
+                && lookup["tool"] == original
+                && lookup["subjects"].is_object()
+                && lookup["facts"].is_array()
+            {
+                self.public_voice_progress
+                    .borrow_mut()
+                    .insert(alias.clone(), lookup.clone());
+            }
             self.routes
                 .borrow_mut()
                 .insert(alias.clone(), (Rc::clone(&client), original));
@@ -711,6 +727,7 @@ impl Mcp {
         self.routes.borrow_mut().clear();
         self.schemas.borrow_mut().clear();
         self.approval_identities.borrow_mut().clear();
+        self.public_voice_progress.borrow_mut().clear();
     }
 }
 

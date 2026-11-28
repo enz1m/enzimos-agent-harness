@@ -3,6 +3,7 @@
 use crate::{Result, ToolError, fail, uid};
 use serde_json::{Value, json};
 use std::{
+    collections::hash_map::Entry,
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::PathBuf,
     time::Duration,
@@ -257,7 +258,7 @@ impl Assembler {
     }
 }
 
-/// Status code and lowercase headers (duplicates refused) up to the blank line.
+/// Status code and lowercase headers up to the blank line.
 pub async fn read_head<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<(u16, std::collections::HashMap<String, String>)> {
@@ -282,14 +283,18 @@ pub async fn read_head<R: tokio::io::AsyncBufRead + Unpin>(
         .and_then(|l| l.split(' ').nth(1))
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(invalid)?;
-    let mut headers = std::collections::HashMap::new();
+    let mut headers = std::collections::HashMap::<String, String>::new();
     for line in lines.filter(|l| !l.is_empty()) {
         let (key, value) = line.split_once(':').ok_or_else(invalid)?;
-        if headers
-            .insert(key.to_ascii_lowercase(), value.trim().to_owned())
-            .is_some()
-        {
-            return fail("duplicate response header");
+        match headers.entry(key.to_ascii_lowercase()) {
+            Entry::Vacant(field) => {
+                field.insert(value.trim().to_owned());
+            }
+            Entry::Occupied(mut field) if field.key() == "server-timing" => {
+                field.get_mut().push_str(", ");
+                field.get_mut().push_str(value.trim());
+            }
+            Entry::Occupied(_) => return fail("duplicate response header"),
         }
     }
     Ok((status, headers))
@@ -373,7 +378,11 @@ impl Gateway {
     }
 
     /// Request one completion and forward any streamed text to `delta`.
-    pub async fn complete(&self, body: Value, delta: Delta) -> Result<Value> {
+    pub async fn complete(&self, mut body: Value, delta: Delta) -> Result<Value> {
+        // The system instruction carries modality across providers with strict request schemas.
+        if let Some(fields) = body.as_object_mut() {
+            fields.remove("conversation_modality");
+        }
         let has_image = body["messages"]
             .as_array()
             .into_iter()
@@ -523,6 +532,22 @@ mod tests {
         let mut skipping = Assembler::default();
         let gap = chunk(json!({"tool_calls": [{"index": 1, "id": "c2"}]}));
         assert!(skipping.feed(gap.as_bytes()).is_err());
+    }
+
+    #[tokio::test]
+    async fn repeated_server_timing_does_not_reject_streaming_response() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nServer-Timing: origin;dur=22\r\nserver-timing: edge;dur=1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let (status, headers) = read_head(&mut BufReader::new(&head[..])).await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(headers["server-timing"], "origin;dur=22, edge;dur=1");
+        assert_eq!(headers["transfer-encoding"], "chunked");
+
+        let ambiguous = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\ncontent-length: 5\r\n\r\n";
+        assert!(
+            read_head(&mut BufReader::new(&ambiguous[..]))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

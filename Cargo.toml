@@ -86,3 +86,6 @@ missing_assert_message = "warn"
 str_to_string = "warn"
 format_push_string = "warn"
 redundant_type_annotations = "warn"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
